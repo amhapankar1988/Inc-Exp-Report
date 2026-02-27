@@ -7,25 +7,24 @@ from langchain_ibm import ChatWatsonx
 
 # --- 1. SECURE INITIALIZATION ---
 def get_llm():
-    api_key = os.getenv("WATSONX_APIKEY")
-    project_id = os.getenv("WATSONX_PROJECT_ID")
-    # Try the explicit regional endpoint
+    # 1. Fetch from st.secrets (Ensure these names match your Streamlit Secrets exactly)
+    api_key = st.secrets["WATSONX_APIKEY"]
+    project_id = st.secrets["WATSONX_PROJECT_ID"]
+    
+    # 2. Regional URL for Toronto - Ensure NO trailing slashes or extra paths
     url = "https://ca-tor.ml.cloud.ibm.com"
 
-    if not api_key or not project_id:
-        st.error(f"Missing Credentials: APIKEY={bool(api_key)}, PID={bool(project_id)}")
-        st.stop()
-
     try:
-        # We explicitly pass the credentials to ChatWatsonx
+        # Using the standard ChatWatsonx initialization
         return ChatWatsonx(
             model_id="meta-llama/llama-3-3-70b-instruct",
             url=url,
-            apikey=api_key, # Use 'apikey' (lowercase) for ChatWatsonx
+            apikey=api_key,
             project_id=project_id,
             params={
                 "decoding_method": "greedy",
-                "max_new_tokens": 1000,
+                "max_new_tokens": 1500,
+                "temperature": 0
             }
         )
     except Exception as e:
