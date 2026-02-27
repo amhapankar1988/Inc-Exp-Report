@@ -9,8 +9,8 @@ from langchain_ibm import ChatWatsonx
 # --- WATSONX SETUP ---
 def init_ai():
     api_key = os.getenv("WATSONX_APIKEY")
-    project_id = os.getenv("PROJECT_ID")
-    url = os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
+    project_id = os.getenv("WATSONX_PROJECT_ID")
+    url = os.getenv("WATSONX_URL", "https://ca-tor.ml.cloud.ibm.com")
 
     if not api_key or not project_id:
         st.error("Credentials missing! Please check HF Secrets.")
