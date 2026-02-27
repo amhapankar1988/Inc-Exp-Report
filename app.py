@@ -4,32 +4,40 @@ import pdfplumber
 import os
 import io
 from langchain_ibm import ChatWatsonx
+from ibm_watsonx_ai import APIClient
 
 # --- 1. SECURE INITIALIZATION ---
 def get_llm():
-    # 1. Fetch from st.secrets
+    # 1. Grab secrets from Streamlit
     api_key = st.secrets["WATSONX_APIKEY"]
     project_id = st.secrets["WATSONX_PROJECT_ID"]
     
-    # 2. Regional URL for Toronto
-    url = "https://ca-tor.ml.cloud.ibm.com"
+    # 2. Build the explicit credentials dictionary
+    # By providing "instance_id": "openshift", we tell the SDK 
+    # to stop looking for a 'username'.
+    credentials = {
+        "url": "https://ca-tor.ml.cloud.ibm.com",
+        "apikey": api_key,
+        "instance_id": "openshift",
+        "version": "5.0"
+    }
 
     try:
-        # Pass instance_id DIRECTLY into the ChatWatsonx call
+        # Create the low-level client first
+        wml_client = APIClient(credentials)
+        
+        # Pass the client directly to ChatWatsonx
         return ChatWatsonx(
             model_id="meta-llama/llama-3-3-70b-instruct",
-            url=url,
-            apikey=api_key,
+            watsonx_client=wml_client,  # <--- This bypasses the logic causing the error
             project_id=project_id,
-            instance_id="openshift",  
             params={
                 "decoding_method": "greedy",
                 "max_new_tokens": 1500,
-                "temperature": 0
             }
         )
     except Exception as e:
-        st.error(f"Connection Error: {str(e)}")
+        st.error(f"Brain Connection Error: {str(e)}")
         st.stop()
 
 # --- 2. CANADIAN BANK DATA NORMALIZATION ---
