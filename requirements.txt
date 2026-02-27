@@ -1,6 +1,6 @@
 streamlit==1.42.0
 pandas>=1.5.0,<2.2.0
-ibm-watsonx-ai==1.1.21
+ibm-watsonx-ai>=1.1.21
 langchain-ibm>=0.3.0
 pdfplumber==0.11.4
 openpyxl==3.1.5
