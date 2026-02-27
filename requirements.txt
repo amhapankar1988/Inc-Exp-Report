@@ -1,0 +1,8 @@
+streamlit
+pandas
+ibm-watsonx-ai
+langchain-ibm
+pdfplumber
+openpyxl
+xlsxwriter
+python-dotenv
