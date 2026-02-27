@@ -5,4 +5,3 @@ langchain-ibm
 pdfplumber
 openpyxl
 xlsxwriter
-python-dotenv
