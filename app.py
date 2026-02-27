@@ -3,128 +3,131 @@ import pandas as pd
 import pdfplumber
 import os
 import io
-import re
 from langchain_ibm import ChatWatsonx
 
-# --- INITIALIZATION ---
-def init_ai():
+# --- 1. SECURE INITIALIZATION ---
+def get_llm():
+    """Initializes using the Toronto Region URL and specific Project ID key."""
+    # Using your specific variable names
     api_key = os.getenv("WATSONX_APIKEY")
-    project_id = os.getenv("WATSONX_PROJECT_ID")
-    url = os.getenv("WATSONX_URL", "https://ca-tor.ml.cloud.ibm.com")
+    project_id = os.getenv("WATSONX_PROJECT_ID") 
+    # Hardcoded to Toronto region as requested
+    url = "https://ca-tor.ml.cloud.ibm.com"
+
+    if not api_key or not project_id:
+        st.error("🔑 Credentials missing! Ensure WATSONX_APIKEY and WATSONX_PROJECT_ID are in HF Secrets.")
+        st.stop()
+
     return ChatWatsonx(
         model_id="meta-llama/llama-3-3-70b-instruct",
         url=url,
         apikey=api_key,
         project_id=project_id,
-        params={"decoding_method": "greedy", "max_new_tokens": 1500}
+        params={"decoding_method": "greedy", "max_new_tokens": 2000}
     )
 
-# --- CANADIAN BANK COLUMN MAPPER ---
-def standardize_columns(df):
-    """Maps common Canadian bank headers to standard internal names."""
+# --- 2. CANADIAN BANK DATA NORMALIZATION ---
+def standardize_df(df):
+    """Standardizes headers for BMO, RBC, Scotia, and Canadian Tire."""
     df.columns = [str(c).strip().lower() for c in df.columns]
-    
-    # Synonyms for mapping
     mapping = {
-        'date': ['date', 'transaction date', 'txn date', 'posted date', 'trans date'],
-        'description': ['description', 'desc', 'transaction', 'memo', 'details', 'name'],
-        'amount': ['amount', 'value', 'debit', 'credit', 'transaction amount', 'amount ($)']
+        'date': ['date', 'transaction date', 'posted date', 'txn date', 'trans date'],
+        'description': ['description', 'desc', 'transaction', 'memo', 'merchant', 'details'],
+        'amount': ['amount', 'debit', 'credit', 'value', 'amount ($)']
     }
     
-    final_map = {}
+    new_cols = {}
     for standard, synonyms in mapping.items():
         for col in df.columns:
             if col in synonyms:
-                final_map[col] = standard.capitalize()
+                new_cols[col] = standard.capitalize()
     
-    return df.rename(columns=final_map)
+    df = df.rename(columns=new_cols)
+    
+    if 'Amount' in df.columns:
+        # Handle Canadian currency formatting: $1,200.00 or (50.00)
+        df['Amount'] = df['Amount'].astype(str).replace(r'[\$,]', '', regex=True)
+        df['Amount'] = df['Amount'].replace(r'\((.*)\)', r'-\1', regex=True)
+        df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+    
+    if 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        
+    return df
 
-# --- DOCUMENT EXTRACTION ---
-def load_data(file):
-    ext = file.name.split('.')[-1].lower()
-    if ext == 'csv':
-        return standardize_columns(pd.read_csv(file))
-    elif ext in ['xlsx', 'xls']:
-        return standardize_columns(pd.read_excel(file))
-    elif ext == 'pdf':
-        with pdfplumber.open(file) as pdf:
-            # Extracting tables directly from PDF often works better for BMO/RBC
-            text = ""
-            for page in pdf.pages:
-                text += page.extract_text() + "\n"
-            return text
-    return None
+# --- 3. UI DASHBOARD ---
+st.set_page_config(page_title="Canada AI Finance", layout="wide")
+st.title("🇨🇦 Canadian Bank Multi-Statement Analyzer")
+st.info("Connected to Watsonx Toronto Region (ca-tor)")
 
-# --- UI CONFIG ---
-st.set_page_config(page_title="Canadian Finance AI", layout="wide")
-st.title("🇨🇦 Canadian Bank Statement Analyzer")
-st.markdown("Optimized for **BMO, Scotiabank, RBC, and Canadian Tire**.")
-
-files = st.file_uploader("Upload Statements", type=["pdf", "csv", "xlsx"], accept_multiple_files=True)
+files = st.file_uploader("Upload BMO, RBC, Scotia, or Canadian Tire statements", 
+                         type=["pdf", "csv", "xlsx"], 
+                         accept_multiple_files=True)
 
 if files:
-    if st.button("🔍 Process and Categorize"):
-        llm = init_ai()
+    if st.button("🚀 Run AI Analysis"):
+        llm = get_llm()
         master_df = pd.DataFrame()
         
         for file in files:
-            with st.status(f"Analyzing {file.name}...", expanded=False) as status:
-                data = load_data(file)
+            with st.spinner(f"Brain is reading {file.name}..."):
+                ext = file.name.split('.')[-1].lower()
                 
-                # Handling CSV/Excel (Structured)
-                if isinstance(data, pd.DataFrame):
-                    # Filter only required columns
-                    needed = ['Date', 'Description', 'Amount']
-                    available = [c for c in needed if c in data.columns]
-                    df_subset = data[available].copy()
+                if ext in ['csv', 'xlsx', 'xls']:
+                    df = pd.read_csv(file) if ext == 'csv' else pd.read_excel(file)
+                    df = standardize_df(df)
+                else:
+                    # PDF Processing (BMO/RBC/Scotiabank Layouts)
+                    with pdfplumber.open(file) as pdf:
+                        text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
+                        pdf_prompt = f"""Extract transactions from this text: {text[:5000]}
+                        Return ONLY a Markdown table: Date | Description | Amount
+                        Use YYYY-MM-DD for dates. Use negative numbers for expenses."""
+                        res = llm.invoke(pdf_prompt)
+                        # Minimal table parser for LLM response
+                        rows = [line.split('|') for line in res.content.split('\n') if '|' in line and '---' not in line]
+                        df = pd.DataFrame([r[1:4] for r in rows[1:]], columns=['Date','Description','Amount'])
+                        df = standardize_df(df)
+                
+                # AI Categorization
+                if not df.empty and 'Description' in df.columns:
+                    unique_merchants = df['Description'].dropna().unique()[:40]
+                    cat_prompt = f"Categorize these Canadian merchants: {unique_merchants}. Return 'Merchant | Category' only."
+                    cat_res = llm.invoke(cat_prompt)
                     
-                    # AI Categorization of unique descriptions (to save cost/time)
-                    unique_desc = df_subset['Description'].dropna().unique().tolist()
-                    
-                    prompt = f"""Categorize these Canadian merchant names into: [Groceries, Utilities, Transport, Entertainment, Shopping, Income, Other].
-                    Return ONLY a list: Merchant | Category
-                    List: {unique_desc[:40]}"""
-                    
-                    response = llm.invoke(prompt)
                     cat_map = {}
-                    for line in response.content.split('\n'):
+                    for line in cat_res.content.split('\n'):
                         if '|' in line:
                             parts = line.split('|')
                             cat_map[parts[0].strip()] = parts[1].strip()
                     
-                    df_subset['Category'] = df_subset['Description'].map(cat_map).fillna('Other')
-                    df_subset['Source'] = file.name
-                    master_df = pd.concat([master_df, df_subset], ignore_index=True)
-
-                # Handling PDF (Unstructured)
-                else:
-                    prompt = f"""Extract a transaction table from this Canadian bank text:
-                    {data[:5000]}
-                    Return ONLY a Markdown table: Date | Description | Amount | Category
-                    Use negative for spending, positive for income."""
-                    
-                    response = llm.invoke(prompt)
-                    # Convert AI text to table (using your existing parse_ai_table logic)
-                    # ... [Insert parse_ai_table call here] ...
-                
-                status.update(label=f"Completed {file.name}!", state="complete")
+                    df['Category'] = df['Description'].map(cat_map).fillna('Other')
+                    df['Source'] = file.name
+                    master_df = pd.concat([master_df, df], ignore_index=True)
 
         if not master_df.empty:
-            # Clean Amount: RBC/BMO sometimes use (10.00) for negative or have currency symbols
-            master_df['Amount'] = pd.to_numeric(
-                master_df['Amount'].astype(str)
-                .replace(r'[\$,]', '', regex=True)
-                .replace(r'\((.*)\)', r'-\1', regex=True), # Converts (10.00) to -10.00
-                errors='coerce'
-            )
-            
-            st.header("📊 Total Monthly Summary")
-            master_df['Date'] = pd.to_datetime(master_df['Date'], errors='coerce')
-            master_df['Month'] = master_df['Date'].dt.to_period('M').astype(str)
-            
+            master_df = master_df.dropna(subset=['Amount', 'Date'])
+            master_df['Month'] = master_df['Date'].dt.strftime('%Y-%m')
+
+            # --- VISUAL SUMMARY ---
+            st.header("📈 Income vs. Expense Trends")
             summary = master_df.groupby('Month').agg(
                 Income=('Amount', lambda x: x[x > 0].sum()),
-                Expenses=('Amount', lambda x: x[x < 0].sum())
+                Expenses=('Amount', lambda x: abs(x[x < 0].sum()))
             )
             st.bar_chart(summary)
-            st.dataframe(master_df)
+
+            # --- DRILL DOWN ---
+            st.header("🔍 Monthly Details")
+            for month in sorted(master_df['Month'].unique(), reverse=True):
+                with st.expander(f"View {month}"):
+                    m_data = master_df[master_df['Month'] == month]
+                    st.dataframe(m_data[['Date', 'Description', 'Amount', 'Category', 'Source']], use_container_width=True)
+
+            # --- EXPORT ---
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                master_df.to_excel(writer, index=False, sheet_name='All_Transactions')
+                summary.to_excel(writer, sheet_name='Monthly_Summary')
+            
+            st.download_button("📥 Download Excel Report", output.getvalue(), "Canadian_Finance_Report.xlsx")
