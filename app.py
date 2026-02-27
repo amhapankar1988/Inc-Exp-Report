@@ -7,20 +7,21 @@ from langchain_ibm import ChatWatsonx
 
 # --- 1. SECURE INITIALIZATION ---
 def get_llm():
-    # 1. Fetch from st.secrets (Ensure these names match your Streamlit Secrets exactly)
+    # 1. Fetch from st.secrets
     api_key = st.secrets["WATSONX_APIKEY"]
     project_id = st.secrets["WATSONX_PROJECT_ID"]
     
-    # 2. Regional URL for Toronto - Ensure NO trailing slashes or extra paths
+    # 2. Regional URL for Toronto
     url = "https://ca-tor.ml.cloud.ibm.com"
 
     try:
-        # Using the standard ChatWatsonx initialization
+        # Pass instance_id DIRECTLY into the ChatWatsonx call
         return ChatWatsonx(
             model_id="meta-llama/llama-3-3-70b-instruct",
             url=url,
             apikey=api_key,
             project_id=project_id,
+            instance_id="openshift",  
             params={
                 "decoding_method": "greedy",
                 "max_new_tokens": 1500,
