@@ -1,7 +1,7 @@
-streamlit
-pandas
-ibm-watsonx-ai
-langchain-ibm
-pdfplumber
-openpyxl
-xlsxwriter
+streamlit==1.42.0
+pandas==2.2.2
+ibm-watsonx-ai==1.1.21
+langchain-ibm==0.1.15
+pdfplumber==0.11.4
+openpyxl==3.1.5
+xlsxwriter==3.2.0
