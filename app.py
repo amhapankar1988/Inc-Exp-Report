@@ -3,37 +3,35 @@ import pandas as pd
 import pdfplumber
 import os
 import io
+from ibm_watsonx_ai import APIClient, Credentials
 from langchain_ibm import ChatWatsonx
-from ibm_watsonx_ai import APIClient
 
 # --- 1. SECURE INITIALIZATION ---
 def get_llm():
-    # 1. Grab secrets from Streamlit
+    # 1. Fetch secrets from Streamlit
     api_key = st.secrets["WATSONX_APIKEY"]
     project_id = st.secrets["WATSONX_PROJECT_ID"]
     
-    # 2. Build the explicit credentials dictionary
-    # By providing "instance_id": "openshift", we tell the SDK 
-    # to stop looking for a 'username'.
-    credentials = {
-        "url": "https://ca-tor.ml.cloud.ibm.com",
-        "apikey": api_key,
-        "instance_id": "openshift",
-        "version": "5.0"
-    }
+    # 2. Build explicit Credentials object
+    # This format forces the SDK to use IBM Cloud IAM instead of legacy login
+    creds = Credentials(
+        url="https://ca-tor.ml.cloud.ibm.com",
+        api_key=api_key
+    )
 
     try:
-        # Create the low-level client first
-        wml_client = APIClient(credentials)
+        # Initialize the low-level client with the clean credentials
+        client = APIClient(creds)
         
-        # Pass the client directly to ChatWatsonx
+        # Pass the client directly to the LangChain wrapper
         return ChatWatsonx(
             model_id="meta-llama/llama-3-3-70b-instruct",
-            watsonx_client=wml_client,  # <--- This bypasses the logic causing the error
+            watsonx_client=client,
             project_id=project_id,
             params={
                 "decoding_method": "greedy",
                 "max_new_tokens": 1500,
+                "temperature": 0
             }
         )
     except Exception as e:
