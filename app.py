@@ -7,24 +7,30 @@ from langchain_ibm import ChatWatsonx
 
 # --- 1. SECURE INITIALIZATION ---
 def get_llm():
-    """Initializes using the Toronto Region URL and specific Project ID key."""
-    # Using your specific variable names
     api_key = os.getenv("WATSONX_APIKEY")
-    project_id = os.getenv("WATSONX_PROJECT_ID") 
-    # Hardcoded to Toronto region as requested
+    project_id = os.getenv("WATSONX_PROJECT_ID")
+    # Try the explicit regional endpoint
     url = "https://ca-tor.ml.cloud.ibm.com"
 
     if not api_key or not project_id:
-        st.error("🔑 Credentials missing! Ensure WATSONX_APIKEY and WATSONX_PROJECT_ID are in HF Secrets.")
+        st.error(f"Missing Credentials: APIKEY={bool(api_key)}, PID={bool(project_id)}")
         st.stop()
 
-    return ChatWatsonx(
-        model_id="meta-llama/llama-3-3-70b-instruct",
-        url=url,
-        apikey=api_key,
-        project_id=project_id,
-        params={"decoding_method": "greedy", "max_new_tokens": 2000}
-    )
+    try:
+        # We explicitly pass the credentials to ChatWatsonx
+        return ChatWatsonx(
+            model_id="meta-llama/llama-3-3-70b-instruct",
+            url=url,
+            apikey=api_key, # Use 'apikey' (lowercase) for ChatWatsonx
+            project_id=project_id,
+            params={
+                "decoding_method": "greedy",
+                "max_new_tokens": 1000,
+            }
+        )
+    except Exception as e:
+        st.error(f"Connection Error: {str(e)}")
+        st.stop()
 
 # --- 2. CANADIAN BANK DATA NORMALIZATION ---
 def standardize_df(df):
