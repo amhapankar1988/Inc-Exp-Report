@@ -28,8 +28,8 @@ def get_ai_model():
         url = "https://ca-tor.ml.cloud.ibm.com"
 
         return ChatWatsonx(
-            # UPDATED: Using the recommended successor model
-            model_id="ibm/granite-4-h-small", 
+            # Switch to a supported, high-performance model from your environment list
+            model_id="meta-llama/llama-3-3-70b-instruct", 
             url=url,
             project_id=project_id,
             apikey=api_key,
