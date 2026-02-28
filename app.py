@@ -1,346 +1,312 @@
 import streamlit as st
-import pandas as pd
 import pdfplumber
-import io
-import datetime
+import pandas as pd
 import re
+import os
+from datetime import datetime
 
-from ibm_watsonx_ai import APIClient, Credentials
-from langchain_ibm import ChatWatsonx
+# Optional AI
+AI_AVAILABLE = True
+try:
+    from ibm_watsonx_ai.foundation_models import Model
+except:
+    AI_AVAILABLE = False
 
-# --------------------------------------------
-# LLM INITIALIZATION (Optional intelligence)
-# --------------------------------------------
-def get_llm():
-    api_key = st.secrets["WATSONX_APIKEY"]
-    project_id = st.secrets["WATSONX_PROJECT_ID"]
+st.set_page_config(page_title="AI Expense Analyzer", layout="wide")
+st.title("AI Bank Statement Analyzer")
 
-    creds = Credentials(
-        url="https://ca-tor.ml.cloud.ibm.com",
-        api_key=api_key
-    )
+# =========================================================
+# CONFIG
+# =========================================================
 
-    client = APIClient(creds)
+REQUIRED_COLUMNS = ["Date", "Description", "Amount", "Type", "Category"]
 
-    return ChatWatsonx(
-        model_id="meta-llama/llama-3-3-70b-instruct",
-        watsonx_client=client,
-        project_id=project_id,
-        params={
-            "decoding_method": "greedy",
-            "max_new_tokens": 3000,
-            "temperature": 0
-        }
-    )
+CATEGORY_RULES = {
+    "Food": ["restaurant", "uber eats", "doordash", "pizza", "tim hortons", "mcdonald"],
+    "Groceries": ["walmart", "costco", "metro", "nofrills", "freshco", "loblaws"],
+    "Transport": ["uber", "lyft", "petro", "esso", "shell", "gas"],
+    "Shopping": ["amazon", "canadian tire", "best buy"],
+    "Bills": ["bell", "rogers", "telus", "insurance", "hydro"],
+    "Entertainment": ["netflix", "spotify", "prime video"],
+}
 
-# --------------------------------------------
-# BANK DETECTION
-# --------------------------------------------
-def detect_bank_type(filename, text_sample):
-    name = filename.lower()
+DATE_FORMATS = [
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%d %b %Y",
+    "%d %b",
+    "%d-%m-%Y"
+]
 
-    if "triangle" in name or "mastercard" in name:
-        return "triangle"
+# =========================================================
+# UTILITIES
+# =========================================================
 
-    if "chequing" in name or "royal bank" in text_sample.lower():
-        return "rbc_chequing"
+def clean_amount(value):
+    if value is None:
+        return 0.0
+    value = str(value)
+    value = value.replace(",", "").replace("$", "").strip()
+    try:
+        return float(value)
+    except:
+        return 0.0
 
-    if "loan" in name or "operating loan" in text_sample.lower():
-        return "rbc_loan"
 
-    return "generic"
+def normalize_date(date_str):
+    if date_str is None:
+        return None
 
-# --------------------------------------------
-# TRIANGLE MASTERCARD PARSER
-# --------------------------------------------
-def parse_triangle_statement(pdf):
-    rows = []
-    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    date_str = str(date_str).strip()
 
-    for page in pdf.pages:
-        text = page.extract_text()
-        if not text:
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except:
             continue
 
-        lines = text.split("\n")
+    try:
+        return pd.to_datetime(date_str, errors="coerce").date()
+    except:
+        return None
 
-        for line in lines:
-            if any(m in line for m in months):
 
-                parts = line.split()
+def ensure_schema(df):
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[REQUIRED_COLUMNS]
 
-                if len(parts) < 4:
+
+# =========================================================
+# UNIVERSAL TRANSACTION PATTERN
+# =========================================================
+
+transaction_pattern = re.compile(
+    r"(\d{2}[/-]\d{2}|\d{2}\s[A-Za-z]{3}|\d{4}-\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})"
+)
+
+# =========================================================
+# PDF PARSING ENGINE
+# =========================================================
+
+def extract_transactions_from_page(page):
+    rows = []
+
+    tables = page.extract_tables()
+
+    if tables:
+        for table in tables:
+            for row in table:
+                if not row:
                     continue
 
-                try:
-                    amount = float(parts[-1].replace(",", ""))
-                except:
-                    continue
+                text = " ".join([str(x) for x in row if x])
 
-                date = parts[0] + " " + parts[1]
-                description = " ".join(parts[2:-1])
+                match = transaction_pattern.search(text)
+                if match:
+                    date, desc, amount = match.groups()
 
-                rows.append({
-                    "Date": date,
-                    "Description": description,
-                    "Amount": amount
-                })
+                    rows.append({
+                        "Date": normalize_date(date),
+                        "Description": desc.strip(),
+                        "Amount": clean_amount(amount)
+                    })
 
-    return pd.DataFrame(rows)
+    text = page.extract_text()
 
-# --------------------------------------------
-# RBC CHEQUING PARSER
-# --------------------------------------------
-def parse_rbc_chequing(pdf):
-    rows = []
-
-    for page in pdf.pages:
-        text = page.extract_text()
-        if not text:
-            continue
-
-        lines = text.split("\n")
-
-        for line in lines:
-            match = re.match(r"(\d{1,2})\s([A-Za-z].+)\s([\d,]+\.\d{2})", line)
-
+    if text:
+        for line in text.split("\n"):
+            match = transaction_pattern.search(line)
             if match:
-                day = match.group(1)
-                description = match.group(2)
-                amount = float(match.group(3).replace(",", ""))
+                date, desc, amount = match.groups()
 
                 rows.append({
-                    "Date": day,
-                    "Description": description,
-                    "Amount": amount
+                    "Date": normalize_date(date),
+                    "Description": desc.strip(),
+                    "Amount": clean_amount(amount)
                 })
 
-    return pd.DataFrame(rows)
+    return rows
 
-# --------------------------------------------
-# RBC LOAN PARSER
-# --------------------------------------------
-def parse_rbc_loan(pdf):
+
+def parse_pdf(uploaded_file):
     rows = []
 
-    for page in pdf.pages:
-        text = page.extract_text()
-        if not text:
-            continue
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            rows.extend(extract_transactions_from_page(page))
 
-        lines = text.split("\n")
-
-        for line in lines:
-            match = re.search(r"([A-Za-z]{3}\s\d{1,2}).*?(-?[\d,]+\.\d{2})", line)
-
-            if match:
-                rows.append({
-                    "Date": match.group(1),
-                    "Description": line,
-                    "Amount": float(match.group(2).replace(",", ""))
-                })
-
-    return pd.DataFrame(rows)
-
-# --------------------------------------------
-# GENERIC FALLBACK PARSER
-# --------------------------------------------
-def parse_generic(pdf):
-    rows = []
-
-    for page in pdf.pages:
-        table = page.extract_table()
-
-        if not table:
-            continue
-
-        for row in table:
-            if len(row) < 3:
-                continue
-
-            try:
-                amount = float(str(row[-1]).replace(",", ""))
-                date = row[0]
-                desc = " ".join([str(x) for x in row[1:-1]])
-
-                rows.append({
-                    "Date": date,
-                    "Description": desc,
-                    "Amount": amount
-                })
-            except:
-                pass
-
-    return pd.DataFrame(rows)
-
-# --------------------------------------------
-# MASTER PARSER
-# --------------------------------------------
-def extract_transactions(file):
-
-    with pdfplumber.open(file) as pdf:
-        sample_text = pdf.pages[0].extract_text()
-
-        bank = detect_bank_type(file.name, sample_text)
-
-        if bank == "triangle":
-            df = parse_triangle_statement(pdf)
-
-        elif bank == "rbc_chequing":
-            df = parse_rbc_chequing(pdf)
-
-        elif bank == "rbc_loan":
-            df = parse_rbc_loan(pdf)
-
-        else:
-            df = parse_generic(pdf)
+    df = pd.DataFrame(rows)
 
     return df
 
-# --------------------------------------------
-# DATA NORMALIZATION
-# --------------------------------------------
-def normalize_dataframe(df):
-    if df.empty:
-        return df
 
-    df.columns = [c.strip() for c in df.columns]
+# =========================================================
+# AI CLASSIFIER
+# =========================================================
 
-    if "Amount" in df.columns:
-        df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+def ai_classify(description):
 
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    if not AI_AVAILABLE:
+        return None
 
-    return df
+    try:
+        prompt = f"""
+Categorize this bank transaction into one of these:
+Food, Groceries, Transport, Shopping, Bills, Entertainment, Income, Other
 
-# --------------------------------------------
-# SMART CANADIAN CATEGORIZATION
-# --------------------------------------------
-def classify_transactions(df):
+Transaction:
+{description}
 
-    mapping = {
-        "Groceries": [
-            "walmart","freshco","fortinos","loblaws","metro",
-            "costco","superstore","nofrills"
-        ],
-        "Dining": [
-            "tim hortons","starbucks","restaurant","pizza",
-            "jimmy the greek","bubble tea"
-        ],
-        "Shopping": [
-            "amazon","apple","best buy","indigo"
-        ],
-        "Transportation": [
-            "uber","lyft","esso","shell","petro"
-        ],
-        "Utilities": [
-            "rogers","bell","hydro","enbridge"
-        ],
-        "Fees": [
-            "fee","interest","service charge"
-        ],
-        "Transfers": [
-            "transfer","payment","e-transfer"
-        ]
-    }
+Return only the category name.
+"""
 
-    def detect(desc):
-        d = str(desc).lower()
+        model = Model(
+            model_id="ibm/granite-13b-chat-v2",
+            params={"temperature": 0}
+        )
 
-        for category, keys in mapping.items():
-            for k in keys:
-                if k in d:
-                    return category
+        result = model.generate(prompt)
+        category = result["results"][0]["generated_text"].strip()
 
+        return category
+
+    except:
+        return None
+
+
+# =========================================================
+# RULE CLASSIFIER
+# =========================================================
+
+def rule_classify(desc):
+    if pd.isna(desc):
         return "Other"
 
-    df["Category"] = df["Description"].apply(detect)
+    desc = desc.lower()
 
+    for category, keywords in CATEGORY_RULES.items():
+        for k in keywords:
+            if k in desc:
+                return category
+
+    return "Other"
+
+
+def classify_transactions(df):
+
+    categories = []
+
+    for desc in df["Description"]:
+
+        category = ai_classify(desc)
+
+        if category is None:
+            category = rule_classify(desc)
+
+        categories.append(category)
+
+    df["Category"] = categories
     return df
 
-# --------------------------------------------
-# STREAMLIT UI
-# --------------------------------------------
-st.set_page_config(page_title="Canada AI Finance", layout="wide")
-st.title("🇨🇦 Canadian Bank Statement Intelligence")
 
-files = st.file_uploader(
-    "Upload Statements",
-    type=["pdf", "csv", "xlsx"],
+# =========================================================
+# INCOME / EXPENSE
+# =========================================================
+
+def detect_income_expense(df):
+    df["Type"] = df["Amount"].apply(
+        lambda x: "Income" if x > 0 else "Expense"
+    )
+    return df
+
+
+# =========================================================
+# DUPLICATE REMOVAL
+# =========================================================
+
+def remove_duplicates(df):
+    return df.drop_duplicates(
+        subset=["Date", "Description", "Amount"]
+    )
+
+
+# =========================================================
+# MASTER PROCESSOR
+# =========================================================
+
+def process_statement(file):
+
+    df = parse_pdf(file)
+
+    if df.empty:
+        return pd.DataFrame(columns=REQUIRED_COLUMNS)
+
+    df = remove_duplicates(df)
+    df = detect_income_expense(df)
+    df = classify_transactions(df)
+
+    return ensure_schema(df)
+
+
+# =========================================================
+# UI
+# =========================================================
+
+uploaded_files = st.file_uploader(
+    "Upload Bank Statements",
+    type=["pdf"],
     accept_multiple_files=True
 )
 
-if files:
-    if st.button("🚀 Run AI Analysis"):
+all_data = []
 
-        master_df = pd.DataFrame()
+if uploaded_files:
 
-        for file in files:
+    with st.spinner("Analyzing statements with AI..."):
 
-            with st.spinner(f"Parsing {file.name}..."):
+        for file in uploaded_files:
+            df = process_statement(file)
 
-                ext = file.name.split(".")[-1].lower()
-
-                if ext == "pdf":
-                    df = extract_transactions(file)
-                elif ext == "csv":
-                    df = pd.read_csv(file)
-                else:
-                    df = pd.read_excel(file)
-
-                df = normalize_dataframe(df)
-                df = classify_transactions(df)
-
+            if not df.empty:
                 df["Source"] = file.name
+                all_data.append(df)
 
-                master_df = pd.concat([master_df, df], ignore_index=True)
+    if all_data:
 
-        master_df = master_df.dropna(subset=["Amount"])
+        final_df = pd.concat(all_data)
 
-        if not master_df.empty:
+        st.subheader("Transactions")
+        st.dataframe(final_df, use_container_width=True)
 
-            master_df["Month-Year"] = master_df["Date"].dt.strftime("%Y-%m")
+        st.subheader("Category Summary")
 
-            pivot = master_df.pivot_table(
-                index="Category",
-                columns="Month-Year",
-                values="Amount",
-                aggfunc="sum",
-                fill_value=0
+        summary = (
+            final_df.groupby("Category")["Amount"]
+            .sum()
+            .reset_index()
+        )
+
+        st.dataframe(summary)
+
+        final_df["Month"] = pd.to_datetime(final_df["Date"]).dt.to_period("M")
+
+        st.subheader("Monthly Cashflow")
+        monthly = final_df.groupby("Month")["Amount"].sum().reset_index()
+        st.dataframe(monthly)
+
+        # Export
+        output_file = "expense_report.xlsx"
+        final_df.to_excel(output_file, index=False)
+
+        with open(output_file, "rb") as f:
+            st.download_button(
+                "Download Excel Report",
+                f,
+                file_name=output_file
             )
 
-            tab1, tab2, tab3 = st.tabs(
-                ["📊 Summary", "🧾 Transactions", "📥 Export"]
-            )
-
-            with tab1:
-                st.subheader("Category Spending")
-                st.dataframe(
-                    pivot.style.format("${:,.2f}"),
-                    use_container_width=True
-                )
-
-                trend = master_df.groupby("Month-Year")["Amount"].sum()
-                st.bar_chart(trend)
-
-            with tab2:
-                st.dataframe(
-                    master_df[
-                        ["Date","Description","Category","Amount","Source"]
-                    ],
-                    use_container_width=True
-                )
-
-            with tab3:
-                output = io.BytesIO()
-
-                with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                    master_df.to_excel(writer, index=False, sheet_name="Transactions")
-                    pivot.to_excel(writer, sheet_name="Summary")
-
-                st.download_button(
-                    "Download Excel Report",
-                    output.getvalue(),
-                    "Financial_Report.xlsx"
-                )
+    else:
+        st.warning("No transactions detected.")
