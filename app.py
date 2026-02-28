@@ -92,34 +92,86 @@ def categorize_data(df, model):
 # 3. ROBUST PARSERS
 # =========================================================
 
+def clean_currency(val):
+    """Helper to clean string currency values into floats."""
+    if not val: return 0.0
+    # Removes $, commas, and handles trailing minus or parentheses for negatives
+    s = str(val).replace('$', '').replace(',', '').strip()
+    if s.startswith('(') and s.endswith(')'): s = '-' + s[1:-1]
+    if s.endswith('-'): s = '-' + s[:-1]
+    try: return float(s)
+    except: return 0.0
+
 def process_pdf(file):
     all_rows = []
+    # Your original regex for Triangle Mastercard
     line_regex = re.compile(r"([A-Z][a-z]{2}\s\d{2})\s+([A-Z][a-z]{2}\s\d{2})\s+(.*?)\s+(-?[\d,]+\.\d{2})")
 
     with pdfplumber.open(file) as pdf:
+        # Check first page text to determine if it's an RBC statement [cite: 1, 28, 55]
+        first_page_text = pdf.pages[0].extract_text() or ""
+        is_rbc = "RBC" in first_page_text.upper() or "ROYAL BANK" in first_page_text.upper()
+
         for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                for line in text.split('\n'):
-                    if "INTEREST CHARGES" in line.upper():
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            all_rows.append([parts[0], "INTEREST CHARGES", parts[-1]])
-                    
-                    match = line_regex.search(line)
-                    if match:
-                        all_rows.append([match.group(1), match.group(3), match.group(4)])
-                        
+            if is_rbc:
+                # RBC Logic: Multi-column Table Extraction 
+                tables = page.extract_tables()
+                for table in tables:
+                    # Look for headers to identify transaction tables 
+                    headers = [str(c).lower() for c in table[0] if c]
+                    if "description" in headers:
+                        for row in table[1:]:
+                            clean_row = [str(c).replace('\n', ' ').strip() if c else "" for c in row]
+                            if len(clean_row) >= 3:
+                                date_val = clean_row[0]
+                                desc_val = clean_row[1] or clean_row[2] # Fallback for different RBC layouts
+                                
+                                # Ignore balance/summary rows 
+                                if any(x in desc_val.lower() for x in ["opening balance", "closing balance", "principal balance"]):
+                                    continue
+
+                                # Handle RBC Chequing (Debits in col 2, Credits in col 3) 
+                                # Handle RBC Credit Line (Amount in col 3) 
+                                amt = 0.0
+                                if "transaction amount" in headers: # Credit Line format 
+                                    amt = clean_currency(clean_row[headers.index("transaction amount")])
+                                else: # Chequing/Savings format 
+                                    debit = clean_currency(clean_row[2]) if len(clean_row) > 2 else 0
+                                    credit = clean_currency(clean_row[3]) if len(clean_row) > 3 else 0
+                                    amt = -abs(debit) if debit != 0 else abs(credit)
+
+                                if amt != 0:
+                                    all_rows.append([date_val, desc_val, amt])
+            else:
+                # Triangle Logic: Your original code remains untouched here
+                # Strategy 1: Table Settings
+                ts = {"vertical_strategy": "lines", "horizontal_strategy": "text", "snap_tolerance": 4, "join_tolerance": 3}
+                tables = page.extract_tables(table_settings=ts)
+                for table in tables:
+                    for row in table:
+                        clean_row = [str(c).replace('\n', ' ').strip() for c in row if c]
+                        if len(clean_row) >= 3:
+                            date_val, amt_val = clean_row[0], clean_row[-1]
+                            desc_val = clean_row[1] if len(clean_row) == 3 else " ".join(clean_row[1:-1])
+                            if re.search(r'\d+\.\d{2}', amt_val):
+                                all_rows.append([date_val, desc_val, clean_currency(amt_val)])
+
+                # Strategy 2: Text Scrape for Interest/Specific Regex
+                text = page.extract_text()
+                if text:
+                    for line in text.split('\n'):
+                        if "INTEREST CHARGES" in line.upper():
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                all_rows.append([parts[0], "INTEREST CHARGES", clean_currency(parts[-1])])
+                        match = line_regex.search(line)
+                        if match:
+                            all_rows.append([match.group(1), match.group(3), clean_currency(match.group(4))])
+
     df = pd.DataFrame(all_rows, columns=["Date", "Description", "Amount"])
     
-    def clean_currency(val):
-        s = str(val).replace('$', '').replace(',', '').strip()
-        if s.endswith('-'): s = '-' + s[:-1]
-        try: return float(s)
-        except: return 0.0
-
-    df["Amount"] = df["Amount"].apply(clean_currency)
-    noise = ["date", "description", "amount", "total", "posting", "page", "statement"]
+    # Final cleanup to remove noise rows 
+    noise = ["date", "description", "amount", "total", "posting", "page", "balance", "cheques & debits"]
     df = df[~df['Description'].str.lower().str.contains('|'.join(noise), na=False)]
     return df
 
