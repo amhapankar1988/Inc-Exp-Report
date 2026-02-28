@@ -2,186 +2,184 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
-import os
 from datetime import datetime
 from langchain_ibm import ChatWatsonx
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 
 # =========================================================
-# CONFIGURATION & SCHEMA
+# 1. INITIALIZATION & SECRETS
 # =========================================================
 
-st.set_page_config(page_title="Pro AI Expense Analyzer", layout="wide")
+st.set_page_config(page_title="AI Expense Analyzer", layout="wide")
 
-# Updated Category List as per requirements
-CATEGORIES = [
+# Define the user's specific categories
+REQUIRED_CATEGORIES = [
     "Utilities", "Interest Charge", "Shopping", "Dining", 
-    "Transportation", "Health and Wellbeing", "Mortgage", "Income", "Other"
+    "Transportation", "Health and Wellbeing", "Mortgage", "Other"
 ]
 
-# Keyword-based Rules for high-confidence local matching
-CATEGORY_RULES = {
-    "Dining": ["starbucks", "mcdonald", "uber eats", "restaurant", "pizza", "tim hortons"],
-    "Transportation": ["uber", "lyft", "petro", "esso", "shell", "gas", "transit"],
-    "Shopping": ["amazon", "walmart", "costco", "best buy", "canadian tire"],
-    "Utilities": ["bell", "rogers", "telus", "hydro", "water", "enbridge"],
-    "Health and Wellbeing": ["shoppers", "pharmacy", "gym", "dentist", "hospital"],
-    "Mortgage": ["mortgage", "chmc", "housing loan"],
-}
-
-# =========================================================
-# AI INITIALIZATION (IBM Watsonx)
-# =========================================================
-
 def get_ai_model():
-    # It's best to use environment variables for credentials
-    api_key = os.getenv("WATSONX_APIKEY")
-    project_id = os.getenv("WATSONX_PROJECT_ID")
-    url = "https://ca-tor.ml.cloud.ibm.com"
+    try:
+        # Accessing Streamlit Secret Variables
+        api_key = st.secrets["WATSONX_APIKEY"]
+        project_id = st.secrets["WATSONX_PROJECT_ID"]
+        url = "https://ca-tor.ml.cloud.ibm.com"
 
-    if api_key == "WATSONX_APIKEY":
+        parameters = {
+            GenParams.DECODING_METHOD: "greedy",
+            GenParams.MAX_NEW_TOKENS: 500,
+            GenParams.TEMPERATURE: 0
+        }
+
+        return ChatWatsonx(
+            model_id="ibm/granite-3-8b-instruct",
+            url=url,
+            project_id=project_id,
+            params=parameters,
+        )
+    except Exception as e:
+        st.error(f"Configuration Error: {e}")
         return None
 
-    parameters = {
-        GenParams.DECODING_METHOD: "greedy",
-        GenParams.MAX_NEW_TOKENS: 200,
-        GenParams.TEMPERATURE: 0
-    }
-
-    return ChatWatsonx(
-        model_id="ibm/granite-3-8b-instruct", # Latest efficient model
-        url=url,
-        project_id=project_id,
-        params=parameters,
-    )
-
 # =========================================================
-# PROCESSING LOGIC
+# 2. PARSING ENGINE (Layout Aware)
 # =========================================================
 
 def clean_amount(val):
-    if not val: return 0.0
-    # Handles negatives and currency symbols
+    if val is None: return 0.0
+    # Remove currency symbols and commas, keep decimals and negative signs
     clean = re.sub(r'[^\d.-]', '', str(val))
-    try: return float(clean)
-    except: return 0.0
+    try:
+        return float(clean)
+    except:
+        return 0.0
 
-def extract_with_layout(page):
-    """Uses spatial positioning to handle multi-column bank statements."""
-    rows = []
-    # Try table extraction first (best for structured grids)
-    tables = page.extract_tables()
-    for table in tables:
-        for row in table:
-            # Filter out empty or header rows
-            if len(row) >= 3 and any(row):
-                rows.append(row)
+def process_pdf(file):
+    all_data = []
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            # Strategy A: Extract Tables
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    # Filter out empty rows or headers (usually rows with < 2 items)
+                    clean_row = [r for r in row if r]
+                    if len(clean_row) >= 3:
+                        all_data.append(clean_row[:3])
+            
+            # Strategy B: Regex fallback for plain text lines
+            if not tables:
+                text = page.extract_text()
+                # Matches Date, Description, and Amount (e.g., 01/24 Uber $15.00)
+                pattern = re.compile(r"(\d{2}[/-]\d{2}|\d{4}-\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})")
+                for line in text.split('\n'):
+                    match = pattern.search(line)
+                    if match:
+                        all_data.append(list(match.groups()))
+                        
+    return pd.DataFrame(all_data, columns=["Date", "Description", "Amount"])
+
+# =========================================================
+# 3. HYBRID AI CLASSIFICATION
+# =========================================================
+
+def classify_transactions_hybrid(df, model):
+    # Local rules for instant matching (High confidence)
+    rules = {
+        "Dining": ["starbucks", "mcdonald", "pizza", "uber eats", "tim hortons", "restaurant"],
+        "Transportation": ["uber", "lyft", "shell", "petro", "esso", "gas", "parking"],
+        "Utilities": ["bell", "rogers", "hydro", "water", "electricity", "telus"],
+        "Health and Wellbeing": ["pharmacy", "gym", "dentist", "shoppers", "hospital", "doctor"],
+        "Mortgage": ["mortgage", "housing loan", "principal payment"]
+    }
+
+    def apply_rules(desc):
+        desc = str(desc).lower()
+        for cat, keywords in rules.items():
+            if any(k in desc for k in keywords):
+                return cat
+        return None
+
+    df["Category"] = df["Description"].apply(apply_rules)
     
-    # Fallback to regex if table extraction is sparse
-    if len(rows) < 3:
-        text = page.extract_text()
-        pattern = re.compile(r"(\d{2}[/-]\d{2}|\d{4}-\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})")
-        for line in text.split('\n'):
-            match = pattern.search(line)
-            if match:
-                rows.append(list(match.groups()))
-    return rows
+    # Identify items that still need AI help
+    mask = df["Category"].isnull()
+    to_classify = df[mask]["Description"].unique().tolist()
 
-def classify_batch(descriptions, model):
-    """Classifies multiple descriptions in one AI call to save time/quota."""
-    if not model or not descriptions:
-        return ["Other"] * len(descriptions)
-
-    formatted_list = "\n".join([f"- {d}" for d in descriptions])
-    prompt = f"""Categorize these bank transactions into exactly one of these: {', '.join(CATEGORIES)}.
-Return only the category names as a comma-separated list in order.
+    if to_classify and model:
+        # Batch classification to save tokens/time
+        formatted_list = "\n".join([f"- {d}" for d in to_classify])
+        prompt = f"""Categorize these bank transactions into ONLY these categories: {', '.join(REQUIRED_CATEGORIES)}.
+Return the results as a Python-style dictionary where key is the description and value is the category.
 
 Transactions:
 {formatted_list}
 """
-    try:
-        response = model.invoke(prompt)
-        results = [c.strip() for c in response.content.split(',')]
-        # Ensure result length matches input
-        return (results + ["Other"] * len(descriptions))[:len(descriptions)]
-    except:
-        return ["Other"] * len(descriptions)
+        try:
+            response = model.invoke(prompt)
+            # Simple parsing of the returned text to find categories
+            for desc in to_classify:
+                for cat in REQUIRED_CATEGORIES:
+                    if cat.lower() in response.content.lower() and desc.lower() in response.content.lower():
+                        df.loc[df["Description"] == desc, "Category"] = cat
+                        break
+        except Exception as e:
+            st.warning(f"AI Batch Error: {e}")
+
+    df["Category"] = df["Category"].fillna("Other")
+    return df
 
 # =========================================================
-# STREAMLIT UI
+# 4. USER INTERFACE
 # =========================================================
 
-st.title("🏦 AI Bank Statement Intelligence")
-st.markdown("Upload your PDF statements to automatically detect, categorize, and analyze spending.")
+st.title("🏦 AI Bank Statement Analyzer")
+st.markdown("Extracts data using **pdfplumber** and categorizes via **IBM Granite AI**.")
 
-uploaded_files = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload Bank Statements (PDF)", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
     model = get_ai_model()
-    all_rows = []
+    master_df = pd.DataFrame()
 
-    with st.spinner("Processing Documents..."):
+    with st.spinner("Analyzing statements..."):
         for file in uploaded_files:
-            with pdfplumber.open(file) as pdf:
-                for page in pdf.pages:
-                    all_rows.extend(extract_with_layout(page))
+            df = process_pdf(file)
+            if not df.empty:
+                df["Amount"] = df["Amount"].apply(clean_amount)
+                df = classify_transactions_hybrid(df, model)
+                master_df = pd.concat([master_df, df], ignore_index=True)
 
-    if all_rows:
-        df = pd.DataFrame(all_rows).iloc[:, :3] # Take first 3 columns
-        df.columns = ["Date", "Description", "Amount"]
-        df["Amount"] = df["Amount"].apply(clean_amount)
-        df = df.dropna(subset=["Description"]).drop_duplicates()
-
-        # Step 1: Local Rule Classification
-        def rule_check(d):
-            d = str(d).lower()
-            for cat, keywords in CATEGORY_RULES.items():
-                if any(k in d for k in keywords): return cat
-            return None
-
-        df["Category"] = df["Description"].apply(rule_check)
-
-        # Step 2: AI Classification for remaining "None"
-        to_classify = df[df["Category"].isnull()]
-        if not to_classify.empty and model:
-            st.info(f"Using AI to classify {len(to_classify)} complex transactions...")
-            ai_results = classify_batch(to_classify["Description"].tolist(), model)
-            df.loc[df["Category"].isnull(), "Category"] = ai_results
-        
-        df["Category"] = df["Category"].fillna("Other")
-
-        # UI: Interactive Editor
-        st.subheader("📝 Review & Edit Transactions")
-        st.caption("Double-click any cell to manually correct the AI's classification.")
-        
+    if not master_df.empty:
+        # Interactive Editor
+        st.subheader("📊 Transaction Breakdown")
         edited_df = st.data_editor(
-            df,
+            master_df,
             column_config={
-                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                "Category": st.column_config.SelectboxColumn("Category", options=REQUIRED_CATEGORIES),
                 "Amount": st.column_config.NumberColumn("Amount", format="$ %.2f")
             },
-            hide_index=True,
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True
         )
 
-        # Dashboard Logic
+        # Summary Metrics
         st.divider()
-        col1, col2 = st.columns(2)
+        c1, c2 = st.columns(2)
         
-        with col1:
-            st.subheader("Spending by Category")
-            summary = edited_df.groupby("Category")["Amount"].sum().sort_values()
+        with c1:
+            st.write("### Spending by Category")
+            summary = edited_df.groupby("Category")["Amount"].sum().abs()
             st.bar_chart(summary)
 
-        with col2:
-            st.subheader("Summary Table")
-            st.table(summary.map(lambda x: f"$ {x:,.2f}"))
+        with c2:
+            st.write("### Total Summary")
+            total_spent = summary.sum()
+            st.metric("Total Expenses Detected", f"${total_spent:,.2f}")
+            st.dataframe(summary.reset_index().rename(columns={"Amount": "Total ($)"}))
 
         # Export
         csv = edited_df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Refined Report (CSV)", csv, "expense_report.csv", "text/csv")
+        st.download_button("📥 Download Excel/CSV", csv, "bank_analysis.csv", "text/csv")
     else:
-        st.error("No transactions found. Try a different PDF layout.")
-
-elif not os.getenv("WATSONX_APIKEY"):
-    st.warning("⚠️ AI Model not connected. Set your IBM Watsonx API keys in environment variables to enable smart classification.")
+        st.warning("No transactions could be parsed. Check the PDF format.")
