@@ -4,309 +4,184 @@ import pandas as pd
 import re
 import os
 from datetime import datetime
-
-# Optional AI
-AI_AVAILABLE = True
-try:
-    from ibm_watsonx_ai.foundation_models import Model
-except:
-    AI_AVAILABLE = False
-
-st.set_page_config(page_title="AI Expense Analyzer", layout="wide")
-st.title("AI Bank Statement Analyzer")
+from langchain_ibm import ChatWatsonx
+from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 
 # =========================================================
-# CONFIG
+# CONFIGURATION & SCHEMA
 # =========================================================
 
-REQUIRED_COLUMNS = ["Date", "Description", "Amount", "Type", "Category"]
+st.set_page_config(page_title="Pro AI Expense Analyzer", layout="wide")
 
-CATEGORY_RULES = {
-    "Food": ["restaurant", "uber eats", "doordash", "pizza", "tim hortons", "mcdonald"],
-    "Groceries": ["walmart", "costco", "metro", "nofrills", "freshco", "loblaws"],
-    "Transport": ["uber", "lyft", "petro", "esso", "shell", "gas"],
-    "Shopping": ["amazon", "canadian tire", "best buy"],
-    "Bills": ["bell", "rogers", "telus", "insurance", "hydro"],
-    "Entertainment": ["netflix", "spotify", "prime video"],
-}
-
-DATE_FORMATS = [
-    "%Y-%m-%d",
-    "%d/%m/%Y",
-    "%m/%d/%Y",
-    "%d %b %Y",
-    "%d %b",
-    "%d-%m-%Y"
+# Updated Category List as per requirements
+CATEGORIES = [
+    "Utilities", "Interest Charge", "Shopping", "Dining", 
+    "Transportation", "Health and Wellbeing", "Mortgage", "Income", "Other"
 ]
 
+# Keyword-based Rules for high-confidence local matching
+CATEGORY_RULES = {
+    "Dining": ["starbucks", "mcdonald", "uber eats", "restaurant", "pizza", "tim hortons"],
+    "Transportation": ["uber", "lyft", "petro", "esso", "shell", "gas", "transit"],
+    "Shopping": ["amazon", "walmart", "costco", "best buy", "canadian tire"],
+    "Utilities": ["bell", "rogers", "telus", "hydro", "water", "enbridge"],
+    "Health and Wellbeing": ["shoppers", "pharmacy", "gym", "dentist", "hospital"],
+    "Mortgage": ["mortgage", "chmc", "housing loan"],
+}
+
 # =========================================================
-# UTILITIES
+# AI INITIALIZATION (IBM Watsonx)
 # =========================================================
 
-def clean_amount(value):
-    if value is None:
-        return 0.0
-    value = str(value)
-    value = value.replace(",", "").replace("$", "").strip()
-    try:
-        return float(value)
-    except:
-        return 0.0
+def get_ai_model():
+    # It's best to use environment variables for credentials
+    api_key = os.getenv("WATSONX_APIKEY")
+    project_id = os.getenv("WATSONX_PROJECT_ID")
+    url = "https://ca-tor.ml.cloud.ibm.com"
 
-
-def normalize_date(date_str):
-    if date_str is None:
+    if api_key == "WATSONX_APIKEY":
         return None
 
-    date_str = str(date_str).strip()
+    parameters = {
+        GenParams.DECODING_METHOD: "greedy",
+        GenParams.MAX_NEW_TOKENS: 200,
+        GenParams.TEMPERATURE: 0
+    }
 
-    for fmt in DATE_FORMATS:
-        try:
-            return datetime.strptime(date_str, fmt).date()
-        except:
-            continue
-
-    try:
-        return pd.to_datetime(date_str, errors="coerce").date()
-    except:
-        return None
-
-
-def ensure_schema(df):
-    for col in REQUIRED_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    return df[REQUIRED_COLUMNS]
-
+    return ChatWatsonx(
+        model_id="ibm/granite-3-8b-instruct", # Latest efficient model
+        url=url,
+        project_id=project_id,
+        params=parameters,
+    )
 
 # =========================================================
-# UNIVERSAL TRANSACTION PATTERN
+# PROCESSING LOGIC
 # =========================================================
 
-transaction_pattern = re.compile(
-    r"(\d{2}[/-]\d{2}|\d{2}\s[A-Za-z]{3}|\d{4}-\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})"
-)
+def clean_amount(val):
+    if not val: return 0.0
+    # Handles negatives and currency symbols
+    clean = re.sub(r'[^\d.-]', '', str(val))
+    try: return float(clean)
+    except: return 0.0
 
-# =========================================================
-# PDF PARSING ENGINE
-# =========================================================
-
-def extract_transactions_from_page(page):
+def extract_with_layout(page):
+    """Uses spatial positioning to handle multi-column bank statements."""
     rows = []
-
+    # Try table extraction first (best for structured grids)
     tables = page.extract_tables()
-
-    if tables:
-        for table in tables:
-            for row in table:
-                if not row:
-                    continue
-
-                text = " ".join([str(x) for x in row if x])
-
-                match = transaction_pattern.search(text)
-                if match:
-                    date, desc, amount = match.groups()
-
-                    rows.append({
-                        "Date": normalize_date(date),
-                        "Description": desc.strip(),
-                        "Amount": clean_amount(amount)
-                    })
-
-    text = page.extract_text()
-
-    if text:
-        for line in text.split("\n"):
-            match = transaction_pattern.search(line)
+    for table in tables:
+        for row in table:
+            # Filter out empty or header rows
+            if len(row) >= 3 and any(row):
+                rows.append(row)
+    
+    # Fallback to regex if table extraction is sparse
+    if len(rows) < 3:
+        text = page.extract_text()
+        pattern = re.compile(r"(\d{2}[/-]\d{2}|\d{4}-\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})")
+        for line in text.split('\n'):
+            match = pattern.search(line)
             if match:
-                date, desc, amount = match.groups()
-
-                rows.append({
-                    "Date": normalize_date(date),
-                    "Description": desc.strip(),
-                    "Amount": clean_amount(amount)
-                })
-
+                rows.append(list(match.groups()))
     return rows
 
+def classify_batch(descriptions, model):
+    """Classifies multiple descriptions in one AI call to save time/quota."""
+    if not model or not descriptions:
+        return ["Other"] * len(descriptions)
 
-def parse_pdf(uploaded_file):
-    rows = []
+    formatted_list = "\n".join([f"- {d}" for d in descriptions])
+    prompt = f"""Categorize these bank transactions into exactly one of these: {', '.join(CATEGORIES)}.
+Return only the category names as a comma-separated list in order.
 
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            rows.extend(extract_transactions_from_page(page))
-
-    df = pd.DataFrame(rows)
-
-    return df
-
-
-# =========================================================
-# AI CLASSIFIER
-# =========================================================
-
-def ai_classify(description):
-
-    if not AI_AVAILABLE:
-        return None
-
-    try:
-        prompt = f"""
-Categorize this bank transaction into one of these:
-Food, Groceries, Transport, Shopping, Bills, Entertainment, Income, Other
-
-Transaction:
-{description}
-
-Return only the category name.
+Transactions:
+{formatted_list}
 """
-
-        model = Model(
-            model_id="ibm/granite-13b-chat-v2",
-            params={"temperature": 0}
-        )
-
-        result = model.generate(prompt)
-        category = result["results"][0]["generated_text"].strip()
-
-        return category
-
+    try:
+        response = model.invoke(prompt)
+        results = [c.strip() for c in response.content.split(',')]
+        # Ensure result length matches input
+        return (results + ["Other"] * len(descriptions))[:len(descriptions)]
     except:
-        return None
-
-
-# =========================================================
-# RULE CLASSIFIER
-# =========================================================
-
-def rule_classify(desc):
-    if pd.isna(desc):
-        return "Other"
-
-    desc = desc.lower()
-
-    for category, keywords in CATEGORY_RULES.items():
-        for k in keywords:
-            if k in desc:
-                return category
-
-    return "Other"
-
-
-def classify_transactions(df):
-
-    categories = []
-
-    for desc in df["Description"]:
-
-        category = ai_classify(desc)
-
-        if category is None:
-            category = rule_classify(desc)
-
-        categories.append(category)
-
-    df["Category"] = categories
-    return df
-
+        return ["Other"] * len(descriptions)
 
 # =========================================================
-# INCOME / EXPENSE
+# STREAMLIT UI
 # =========================================================
 
-def detect_income_expense(df):
-    df["Type"] = df["Amount"].apply(
-        lambda x: "Income" if x > 0 else "Expense"
-    )
-    return df
+st.title("🏦 AI Bank Statement Intelligence")
+st.markdown("Upload your PDF statements to automatically detect, categorize, and analyze spending.")
 
-
-# =========================================================
-# DUPLICATE REMOVAL
-# =========================================================
-
-def remove_duplicates(df):
-    return df.drop_duplicates(
-        subset=["Date", "Description", "Amount"]
-    )
-
-
-# =========================================================
-# MASTER PROCESSOR
-# =========================================================
-
-def process_statement(file):
-
-    df = parse_pdf(file)
-
-    if df.empty:
-        return pd.DataFrame(columns=REQUIRED_COLUMNS)
-
-    df = remove_duplicates(df)
-    df = detect_income_expense(df)
-    df = classify_transactions(df)
-
-    return ensure_schema(df)
-
-
-# =========================================================
-# UI
-# =========================================================
-
-uploaded_files = st.file_uploader(
-    "Upload Bank Statements",
-    type=["pdf"],
-    accept_multiple_files=True
-)
-
-all_data = []
+uploaded_files = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
+    model = get_ai_model()
+    all_rows = []
 
-    with st.spinner("Analyzing statements with AI..."):
-
+    with st.spinner("Processing Documents..."):
         for file in uploaded_files:
-            df = process_statement(file)
+            with pdfplumber.open(file) as pdf:
+                for page in pdf.pages:
+                    all_rows.extend(extract_with_layout(page))
 
-            if not df.empty:
-                df["Source"] = file.name
-                all_data.append(df)
+    if all_rows:
+        df = pd.DataFrame(all_rows).iloc[:, :3] # Take first 3 columns
+        df.columns = ["Date", "Description", "Amount"]
+        df["Amount"] = df["Amount"].apply(clean_amount)
+        df = df.dropna(subset=["Description"]).drop_duplicates()
 
-    if all_data:
+        # Step 1: Local Rule Classification
+        def rule_check(d):
+            d = str(d).lower()
+            for cat, keywords in CATEGORY_RULES.items():
+                if any(k in d for k in keywords): return cat
+            return None
 
-        final_df = pd.concat(all_data)
+        df["Category"] = df["Description"].apply(rule_check)
 
-        st.subheader("Transactions")
-        st.dataframe(final_df, use_container_width=True)
+        # Step 2: AI Classification for remaining "None"
+        to_classify = df[df["Category"].isnull()]
+        if not to_classify.empty and model:
+            st.info(f"Using AI to classify {len(to_classify)} complex transactions...")
+            ai_results = classify_batch(to_classify["Description"].tolist(), model)
+            df.loc[df["Category"].isnull(), "Category"] = ai_results
+        
+        df["Category"] = df["Category"].fillna("Other")
 
-        st.subheader("Category Summary")
-
-        summary = (
-            final_df.groupby("Category")["Amount"]
-            .sum()
-            .reset_index()
+        # UI: Interactive Editor
+        st.subheader("📝 Review & Edit Transactions")
+        st.caption("Double-click any cell to manually correct the AI's classification.")
+        
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                "Amount": st.column_config.NumberColumn("Amount", format="$ %.2f")
+            },
+            hide_index=True,
+            use_container_width=True
         )
 
-        st.dataframe(summary)
+        # Dashboard Logic
+        st.divider()
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Spending by Category")
+            summary = edited_df.groupby("Category")["Amount"].sum().sort_values()
+            st.bar_chart(summary)
 
-        final_df["Month"] = pd.to_datetime(final_df["Date"]).dt.to_period("M")
-
-        st.subheader("Monthly Cashflow")
-        monthly = final_df.groupby("Month")["Amount"].sum().reset_index()
-        st.dataframe(monthly)
+        with col2:
+            st.subheader("Summary Table")
+            st.table(summary.map(lambda x: f"$ {x:,.2f}"))
 
         # Export
-        output_file = "expense_report.xlsx"
-        final_df.to_excel(output_file, index=False)
-
-        with open(output_file, "rb") as f:
-            st.download_button(
-                "Download Excel Report",
-                f,
-                file_name=output_file
-            )
-
+        csv = edited_df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Refined Report (CSV)", csv, "expense_report.csv", "text/csv")
     else:
-        st.warning("No transactions detected.")
+        st.error("No transactions found. Try a different PDF layout.")
+
+elif not os.getenv("WATSONX_APIKEY"):
+    st.warning("⚠️ AI Model not connected. Set your IBM Watsonx API keys in environment variables to enable smart classification.")
