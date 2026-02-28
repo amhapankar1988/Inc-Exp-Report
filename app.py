@@ -18,8 +18,9 @@ if "custom_rules" not in st.secrets:
         st.session_state.custom_rules = {}
 
 REQUIRED_CATEGORIES = [
-    "Utilities", "Interest Charge", "Shopping", "Dining", 
-    "Transportation", "Health and Wellbeing", "Mortgage", "Other"
+    "Utilities", "Interest Charge", "Shopping", "Food & Dining", 
+    "Transportation", "Entertainment", "Health & Fitness", "Mortgage", 
+    "Housing", "Deposits", "Withdrawals", "Overdraft Fee", "NSF", "Monthly Account Fee", "Other"
 ]
 
 def get_ai_model():
