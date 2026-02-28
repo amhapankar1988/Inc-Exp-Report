@@ -127,24 +127,50 @@ def process_excel_csv(file):
     filename = file.name.lower()
     try:
         if filename.endswith('.csv'):
-            df = pd.read_csv(file, skiprows=1) # Skipping the filter/header row found in your samples 
+            # Load CSV, skipping the first 'Filter' description row
+            df = pd.read_csv(file, skiprows=1)
         else:
             df = pd.read_excel(file, engine='openpyxl')
+
+        # 1. Clean up column names (remove extra spaces/newlines)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # 2. Identify columns by position or name
+        # Your CSVs have: Filter(0), Date(1), Description(2), Sub-description(3), Type(4), Amount(5)
+        # We search for keywords in case the order changes
+        cols = df.columns.tolist()
+        date_col = next((c for c in cols if "Date" in c), cols[1])
+        desc_col = next((c for c in cols if "Description" in c), cols[2])
+        sub_desc_col = next((c for c in cols if "Sub-description" in c), None)
+        type_col = next((c for c in cols if "Type" in c), None)
+        amount_col = next((c for c in cols if "Amount" in c), cols[-1])
+
+        # 3. Create a clean copy with standard names
+        new_df = pd.DataFrame()
+        new_df["Date"] = df[date_col]
         
-        # Standardizing Column Names based on your sample files 
-        mapping = {
-            'Date': 'Date',
-            'Description': 'Description',
-            'Sub-description': 'Sub_Description',
-            'Amount': 'Amount'
-        }
-        df.rename(columns=mapping, inplace=True)
+        # Combine Description and Sub-description for better AI context
+        if sub_desc_col:
+            new_df["Description"] = df[desc_col].fillna('') + " " + df[sub_desc_col].fillna('')
+        else:
+            new_df["Description"] = df[desc_col]
+
+        # 4. Handle Amount Logic (Debit vs Credit)
+        # In your CSV, 'Debit' amounts are often negative strings, 
+        # but we ensure the logic is solid here.
+        temp_amount = pd.to_numeric(df[amount_col].astype(str).str.replace('[$,]', '', regex=True), errors='coerce').fillna(0.0)
         
-        # Merge Description and Sub-description for better AI context [cite: 201, 492]
-        if 'Sub_Description' in df.columns:
-            df['Description'] = df['Description'].fillna('') + ' ' + df['Sub_Description'].fillna('')
-        
-        return df[['Date', 'Description', 'Amount']]
+        if type_col:
+            # Ensure Debits are negative and Credits are positive if they aren't already
+            new_df["Amount"] = df.apply(
+                lambda row: -abs(temp_amount[row.name]) if "Debit" in str(row[type_col]) else abs(temp_amount[row.name]), 
+                axis=1
+            )
+        else:
+            new_df["Amount"] = temp_amount
+
+        return new_df[["Date", "Description", "Amount"]]
+
     except Exception as e:
         st.error(f"Error reading {filename}: {e}")
     return pd.DataFrame()
