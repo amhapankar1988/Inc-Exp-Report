@@ -2,7 +2,7 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
-from datetime import datetime
+import io
 from langchain_ibm import ChatWatsonx
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 
@@ -10,9 +10,8 @@ from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 # 1. INITIALIZATION & SECRETS
 # =========================================================
 
-st.set_page_config(page_title="AI Expense Analyzer", layout="wide")
+st.set_page_config(page_title="Universal AI Expense Analyzer", layout="wide")
 
-# Define the user's specific categories
 REQUIRED_CATEGORIES = [
     "Utilities", "Interest Charge", "Shopping", "Dining", 
     "Transportation", "Health and Wellbeing", "Mortgage", "Other"
@@ -20,7 +19,6 @@ REQUIRED_CATEGORIES = [
 
 def get_ai_model():
     try:
-        # Accessing Streamlit Secret Variables
         api_key = st.secrets["WATSONX_APIKEY"]
         project_id = st.secrets["WATSONX_PROJECT_ID"]
         url = "https://ca-tor.ml.cloud.ibm.com"
@@ -38,148 +36,108 @@ def get_ai_model():
             params=parameters,
         )
     except Exception as e:
-        st.error(f"Configuration Error: {e}")
+        st.error(f"AI Configuration Error: Check Streamlit Secrets. {e}")
         return None
 
 # =========================================================
-# 2. PARSING ENGINE (Layout Aware)
+# 2. ENHANCED EXTRACTION ENGINE (The Fix)
 # =========================================================
 
 def clean_amount(val):
-    if val is None: return 0.0
-    # Remove currency symbols and commas, keep decimals and negative signs
+    if val is None or pd.isna(val): return 0.0
+    # Capture negatives, decimals, and digits only
     clean = re.sub(r'[^\d.-]', '', str(val))
     try:
+        # Handle cases like '12.50-' or '-12.50'
+        if clean.endswith('-'):
+            clean = '-' + clean[:-1]
         return float(clean)
     except:
         return 0.0
 
-def process_pdf(file):
-    all_data = []
+def extract_from_pdf(file):
+    """Enhanced PDF extraction with multiple fallback strategies."""
+    all_rows = []
+    
+    # Common Regex Pattern for Bank Lines: Date | Description | Amount
+    # Matches: 2024-01-01 / Jan 01 / 01-01-24 + Text + $1,234.56
+    line_regex = re.compile(r"(\d{1,4}[/-]\d{1,2}[/-]?\d{0,4}|[A-Z][a-z]{2}\s\d{1,2})\s+(.*?)\s+(-?\$?[\d,]+\.\d{2})")
+
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            # Strategy A: Extract Tables
-            tables = page.extract_tables()
+            # STRATEGY 1: Table Extraction (Best for structured grids)
+            tables = page.extract_tables(table_settings={
+                "vertical_strategy": "lines", 
+                "horizontal_strategy": "text",
+                "snap_tol": 3
+            })
+            
             for table in tables:
                 for row in table:
-                    # Filter out empty rows or headers (usually rows with < 2 items)
-                    clean_row = [r for r in row if r]
+                    # Clean the row of None/Empty strings
+                    clean_row = [str(cell).strip() for cell in row if cell and str(cell).strip()]
                     if len(clean_row) >= 3:
-                        all_data.append(clean_row[:3])
-            
-            # Strategy B: Regex fallback for plain text lines
-            if not tables:
-                text = page.extract_text()
-                # Matches Date, Description, and Amount (e.g., 01/24 Uber $15.00)
-                pattern = re.compile(r"(\d{2}[/-]\d{2}|\d{4}-\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})")
-                for line in text.split('\n'):
-                    match = pattern.search(line)
-                    if match:
-                        all_data.append(list(match.groups()))
-                        
-    return pd.DataFrame(all_data, columns=["Date", "Description", "Amount"])
+                        all_rows.append(clean_row[:3])
+
+            # STRATEGY 2: Text-Line Regex (If Strategy 1 found nothing)
+            if not all_rows:
+                text = page.extract_text(layout=True) # preserve visual layout
+                if text:
+                    for line in text.split('\n'):
+                        match = line_regex.search(line)
+                        if match:
+                            all_rows.append(list(match.groups()))
+
+    # Convert to DF and remove common header words
+    df = pd.DataFrame(all_rows, columns=["Date", "Description", "Amount"])
+    df = df[~df['Description'].str.contains("Description|Balance|Transaction|Date", case=False, na=False)]
+    return df
+
+def parse_structured_file(file):
+    """Handles CSV and Excel with header mapping."""
+    file_ext = file.name.split('.')[-1].lower()
+    df = pd.read_csv(file) if file_ext == 'csv' else pd.read_excel(file)
+    
+    new_df = pd.DataFrame()
+    cols = df.columns.tolist()
+    
+    # Smart column mapping
+    date_col = next((c for c in cols if 'date' in c.lower()), None)
+    desc_col = next((c for c in cols if any(x in c.lower() for x in ['desc', 'memo', 'trans', 'details'])), None)
+    amt_col = next((c for c in cols if any(x in c.lower() for x in ['amt', 'amount', 'value', 'charge', 'debit'])), None)
+    
+    if date_col and desc_col and amt_col:
+        new_df["Date"] = df[date_col]
+        new_df["Description"] = df[desc_col]
+        new_df["Amount"] = df[amt_col]
+        return new_df
+    return pd.DataFrame()
 
 # =========================================================
-# 3. HYBRID AI CLASSIFICATION
+# 3. CLASSIFICATION & UI (Updated)
 # =========================================================
 
-def classify_transactions_hybrid(df, model):
-    # Local rules for instant matching (High confidence)
+def classify_transactions(df, model):
     rules = {
-        "Dining": ["starbucks", "mcdonald", "pizza", "uber eats", "tim hortons", "restaurant"],
-        "Transportation": ["uber", "lyft", "shell", "petro", "esso", "gas", "parking"],
-        "Utilities": ["bell", "rogers", "hydro", "water", "electricity", "telus"],
-        "Health and Wellbeing": ["pharmacy", "gym", "dentist", "shoppers", "hospital", "doctor"],
-        "Mortgage": ["mortgage", "housing loan", "principal payment"]
+        "Dining": ["starbucks", "mcdonald", "pizza", "uber eats", "tim hortons", "dining", "restaurant", "pub", "bar"],
+        "Transportation": ["uber", "lyft", "shell", "petro", "esso", "gas", "parking", "transit", "presto"],
+        "Utilities": ["bell", "rogers", "hydro", "water", "electricity", "telus", "internet", "enbridge"],
+        "Health and Wellbeing": ["pharmacy", "gym", "dentist", "shoppers", "hospital", "medical", "physio"],
+        "Mortgage": ["mortgage", "housing loan", "home loan", "property tax"],
+        "Interest Charge": ["interest charge", "finance charge", "interest pd", "service fee"]
     }
 
     def apply_rules(desc):
         desc = str(desc).lower()
         for cat, keywords in rules.items():
-            if any(k in desc for k in keywords):
-                return cat
+            if any(k in desc for k in keywords): return cat
         return None
 
     df["Category"] = df["Description"].apply(apply_rules)
     
-    # Identify items that still need AI help
     mask = df["Category"].isnull()
-    to_classify = df[mask]["Description"].unique().tolist()
+    unique_to_classify = df[mask]["Description"].unique().tolist()
 
-    if to_classify and model:
-        # Batch classification to save tokens/time
-        formatted_list = "\n".join([f"- {d}" for d in to_classify])
-        prompt = f"""Categorize these bank transactions into ONLY these categories: {', '.join(REQUIRED_CATEGORIES)}.
-Return the results as a Python-style dictionary where key is the description and value is the category.
-
-Transactions:
-{formatted_list}
-"""
-        try:
-            response = model.invoke(prompt)
-            # Simple parsing of the returned text to find categories
-            for desc in to_classify:
-                for cat in REQUIRED_CATEGORIES:
-                    if cat.lower() in response.content.lower() and desc.lower() in response.content.lower():
-                        df.loc[df["Description"] == desc, "Category"] = cat
-                        break
-        except Exception as e:
-            st.warning(f"AI Batch Error: {e}")
-
-    df["Category"] = df["Category"].fillna("Other")
-    return df
-
-# =========================================================
-# 4. USER INTERFACE
-# =========================================================
-
-st.title("🏦 AI Bank Statement Analyzer")
-st.markdown("Extracts data using **pdfplumber** and categorizes via **IBM Granite AI**.")
-
-uploaded_files = st.file_uploader("Upload Bank Statements (PDF)", type="pdf", accept_multiple_files=True)
-
-if uploaded_files:
-    model = get_ai_model()
-    master_df = pd.DataFrame()
-
-    with st.spinner("Analyzing statements..."):
-        for file in uploaded_files:
-            df = process_pdf(file)
-            if not df.empty:
-                df["Amount"] = df["Amount"].apply(clean_amount)
-                df = classify_transactions_hybrid(df, model)
-                master_df = pd.concat([master_df, df], ignore_index=True)
-
-    if not master_df.empty:
-        # Interactive Editor
-        st.subheader("📊 Transaction Breakdown")
-        edited_df = st.data_editor(
-            master_df,
-            column_config={
-                "Category": st.column_config.SelectboxColumn("Category", options=REQUIRED_CATEGORIES),
-                "Amount": st.column_config.NumberColumn("Amount", format="$ %.2f")
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-
-        # Summary Metrics
-        st.divider()
-        c1, c2 = st.columns(2)
-        
-        with c1:
-            st.write("### Spending by Category")
-            summary = edited_df.groupby("Category")["Amount"].sum().abs()
-            st.bar_chart(summary)
-
-        with c2:
-            st.write("### Total Summary")
-            total_spent = summary.sum()
-            st.metric("Total Expenses Detected", f"${total_spent:,.2f}")
-            st.dataframe(summary.reset_index().rename(columns={"Amount": "Total ($)"}))
-
-        # Export
-        csv = edited_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Excel/CSV", csv, "bank_analysis.csv", "text/csv")
-    else:
-        st.warning("No transactions could be parsed. Check the PDF format.")
+    if unique_to_classify and model:
+        formatted_list = "\n".join([f"- {d}" for d in unique_to_classify[:30]])
+        prompt = f"Categorize into {', '.join(REQUIRED_CATEGORIES)}. Return as: 'Description | Category'.\n\n{formatted_list}"
