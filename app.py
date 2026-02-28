@@ -2,166 +2,311 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
+import os
 from datetime import datetime
-from thefuzz import process
 
-# --- AI CONFIG ---
+# Optional AI
 AI_AVAILABLE = True
 try:
     from ibm_watsonx_ai.foundation_models import Model
 except:
     AI_AVAILABLE = False
 
-st.set_page_config(page_title="Pro Finance AI", layout="wide")
+st.set_page_config(page_title="AI Expense Analyzer", layout="wide")
+st.title("AI Bank Statement Analyzer")
 
 # =========================================================
-# 1. BANK ADAPTER DEFINITIONS
+# CONFIG
 # =========================================================
-# Each bank has a unique way of identifying itself and a unique column structure.
-BANK_MAP = {
-    "RBC": {
-        "keywords": ["ROYAL BANK", "RBC"],
-        "cols": ["Date", "Description", "Withdrawals", "Deposits", "Balance"]
-    },
-    "TD": {
-        "keywords": ["TD CANADA TRUST", "TORONTO-DOMINION"],
-        "cols": ["Date", "Description", "Debit", "Credit", "Balance"]
-    },
-    "CIBC": {
-        "keywords": ["CIBC", "CANADIAN IMPERIAL"],
-        "cols": ["Date", "Description", "Purchases", "Payments", "Balance"]
-    }
+
+REQUIRED_COLUMNS = ["Date", "Description", "Amount", "Type", "Category"]
+
+CATEGORY_RULES = {
+    "Food": ["restaurant", "uber eats", "doordash", "pizza", "tim hortons", "mcdonald"],
+    "Groceries": ["walmart", "costco", "metro", "nofrills", "freshco", "loblaws"],
+    "Transport": ["uber", "lyft", "petro", "esso", "shell", "gas"],
+    "Shopping": ["amazon", "canadian tire", "best buy"],
+    "Bills": ["bell", "rogers", "telus", "insurance", "hydro"],
+    "Entertainment": ["netflix", "spotify", "prime video"],
 }
 
-KNOWN_MERCHANTS = [
-    "Amazon", "Uber", "Uber Eats", "Lyft", "Walmart", "Costco", "Netflix", 
-    "Spotify", "Starbucks", "McDonalds", "Tim Hortons", "Shell", "Petro-Canada",
-    "Bell", "Rogers", "Telus", "Hydro", "Airbnb", "DoorDash", "Instacart"
+DATE_FORMATS = [
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%d %b %Y",
+    "%d %b",
+    "%d-%m-%Y"
 ]
 
 # =========================================================
-# 2. CORE UTILITIES & NORMALIZATION
+# UTILITIES
 # =========================================================
 
-def detect_bank(text):
-    """Identifies the bank based on text content."""
-    for bank, config in BANK_MAP.items():
-        if any(k in text.upper() for k in config["keywords"]):
-            return bank
-    return "Generic"
+def clean_amount(value):
+    if value is None:
+        return 0.0
+    value = str(value)
+    value = value.replace(",", "").replace("$", "").strip()
+    try:
+        return float(value)
+    except:
+        return 0.0
 
-def normalize_merchant(desc):
-    """Cleans 'AMZN MKTP CA*1234' into 'Amazon'."""
-    if not desc: return "Unknown"
-    # Basic cleanup: remove numbers, special chars, and extra spaces
-    clean_desc = re.sub(r'[^a-zA-Z\s]', '', desc).strip()
-    
-    # Fuzzy matching against known high-frequency merchants
-    match, score = process.extractOne(clean_desc, KNOWN_MERCHANTS)
-    return match if score > 85 else clean_desc
 
-@st.cache_data
-def ai_classify_batch(descriptions):
-    """Mock/Stub for Batch AI processing to save tokens/time."""
-    # In production, you would send 20 descriptions at once to WatsonX
-    # and return a list of categories.
-    pass
+def normalize_date(date_str):
+    if date_str is None:
+        return None
+
+    date_str = str(date_str).strip()
+
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except:
+            continue
+
+    try:
+        return pd.to_datetime(date_str, errors="coerce").date()
+    except:
+        return None
+
+
+def ensure_schema(df):
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[REQUIRED_COLUMNS]
+
 
 # =========================================================
-# 3. ADVANCED EXTRACTION ENGINE
+# UNIVERSAL TRANSACTION PATTERN
 # =========================================================
 
-def extract_intelligent(uploaded_file):
-    all_rows = []
-    bank_detected = "Generic"
-    
+transaction_pattern = re.compile(
+    r"(\d{2}[/-]\d{2}|\d{2}\s[A-Za-z]{3}|\d{4}-\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})"
+)
+
+# =========================================================
+# PDF PARSING ENGINE
+# =========================================================
+
+def extract_transactions_from_page(page):
+    rows = []
+
+    tables = page.extract_tables()
+
+    if tables:
+        for table in tables:
+            for row in table:
+                if not row:
+                    continue
+
+                text = " ".join([str(x) for x in row if x])
+
+                match = transaction_pattern.search(text)
+                if match:
+                    date, desc, amount = match.groups()
+
+                    rows.append({
+                        "Date": normalize_date(date),
+                        "Description": desc.strip(),
+                        "Amount": clean_amount(amount)
+                    })
+
+    text = page.extract_text()
+
+    if text:
+        for line in text.split("\n"):
+            match = transaction_pattern.search(line)
+            if match:
+                date, desc, amount = match.groups()
+
+                rows.append({
+                    "Date": normalize_date(date),
+                    "Description": desc.strip(),
+                    "Amount": clean_amount(amount)
+                })
+
+    return rows
+
+
+def parse_pdf(uploaded_file):
+    rows = []
+
     with pdfplumber.open(uploaded_file) as pdf:
-        # 1. Peek at first page to detect bank
-        first_page_text = pdf.pages[0].extract_text() or ""
-        bank_detected = detect_bank(first_page_text)
-        
         for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                df_page = pd.DataFrame(table)
-                
-                # Filter out rows that are clearly not transactions (empty or header-only)
-                for _, row in df_page.iterrows():
-                    row_str = " ".join([str(x) for x in row if x])
-                    
-                    # Look for date-like patterns to identify transaction rows
-                    if re.search(r'(\d{2}[/-]\d{2}|\w{3}\s\d{2})', row_str):
-                        # Extract amounts (assuming last two columns are usually money)
-                        amounts = [re.sub(r'[^\d.-]', '', str(x)) for x in row if x and any(c.isdigit() for c in str(x))]
-                        
-                        all_rows.append({
-                            "Raw_Date": row[0],
-                            "Raw_Description": row[1] if len(row) > 1 else "",
-                            "Amount": amounts[0] if amounts else 0,
-                            "Bank": bank_detected
-                        })
+            rows.extend(extract_transactions_from_page(page))
 
-    return pd.DataFrame(all_rows)
+    df = pd.DataFrame(rows)
 
-# =========================================================
-# 4. ENRICHMENT & ANALYTICS
-# =========================================================
-
-def enrich_data(df):
-    if df.empty: return df
-    
-    # Clean Amounts
-    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
-    
-    # Merchant Normalization
-    df['Clean_Merchant'] = df['Raw_Description'].apply(normalize_merchant)
-    
-    # Fraud/Anomaly Detection
-    # Flag transactions that are 2x the standard deviation of the user's spending
-    mean_spend = df[df['Amount'] < 0]['Amount'].mean()
-    std_spend = df[df['Amount'] < 0]['Amount'].std()
-    df['Potential_Anomaly'] = df['Amount'].apply(lambda x: "⚠️ High" if x < (mean_spend - 2*std_spend) else "Normal")
-    
     return df
 
+
 # =========================================================
-# 5. UI INTERFACE
+# AI CLASSIFIER
 # =========================================================
 
-st.title("🚀 Pro-Fintech AI Analyzer")
-st.markdown("### Auto-detects Bank | Normalizes Merchants | Fraud Insights")
+def ai_classify(description):
 
-files = st.file_uploader("Upload Statements (RBC, TD, CIBC supported)", type="pdf", accept_multiple_files=True)
+    if not AI_AVAILABLE:
+        return None
 
-if files:
-    final_dfs = []
-    
-    with st.status("Processing Financial Data...", expanded=True) as status:
-        for f in files:
-            st.write(f"Reading {f.name}...")
-            raw_df = extract_intelligent(f)
-            enriched_df = enrich_data(raw_df)
-            final_dfs.append(enriched_df)
-        
-        status.update(label="Analysis Complete!", state="complete", expanded=False)
+    try:
+        prompt = f"""
+Categorize this bank transaction into one of these:
+Food, Groceries, Transport, Shopping, Bills, Entertainment, Income, Other
 
-    full_data = pd.concat(final_dfs)
+Transaction:
+{description}
 
-    # Dashboard Metrics
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Transactions", len(full_data))
-    col2.metric("Banks Detected", ", ".join(full_data['Bank'].unique()))
-    col3.metric("Largest Expense", f"${full_data['Amount'].min():,.2f}")
+Return only the category name.
+"""
 
-    # Display Data
-    st.subheader("Normalized Transaction Feed")
-    st.dataframe(full_data[['Raw_Date', 'Clean_Merchant', 'Amount', 'Bank', 'Potential_Anomaly']], use_container_width=True)
+        model = Model(
+            model_id="ibm/granite-13b-chat-v2",
+            params={"temperature": 0}
+        )
 
-    # Insights Section
-    st.subheader("💡 Spending Insights")
-    top_merchants = full_data.groupby('Clean_Merchant')['Amount'].sum().sort_values().head(5)
-    st.bar_chart(top_merchants)
+        result = model.generate(prompt)
+        category = result["results"][0]["generated_text"].strip()
 
-    # Export
-    csv = full_data.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Clean Data (CSV)", csv, "cleaned_finance_data.csv", "text/csv")
+        return category
+
+    except:
+        return None
+
+
+# =========================================================
+# RULE CLASSIFIER
+# =========================================================
+
+def rule_classify(desc):
+    if pd.isna(desc):
+        return "Other"
+
+    desc = desc.lower()
+
+    for category, keywords in CATEGORY_RULES.items():
+        for k in keywords:
+            if k in desc:
+                return category
+
+    return "Other"
+
+
+def classify_transactions(df):
+
+    categories = []
+
+    for desc in df["Description"]:
+
+        category = ai_classify(desc)
+
+        if category is None:
+            category = rule_classify(desc)
+
+        categories.append(category)
+
+    df["Category"] = categories
+    return df
+
+
+# =========================================================
+# INCOME / EXPENSE
+# =========================================================
+
+def detect_income_expense(df):
+    df["Type"] = df["Amount"].apply(
+        lambda x: "Income" if x > 0 else "Expense"
+    )
+    return df
+
+
+# =========================================================
+# DUPLICATE REMOVAL
+# =========================================================
+
+def remove_duplicates(df):
+    return df.drop_duplicates(
+        subset=["Date", "Description", "Amount"]
+    )
+
+
+# =========================================================
+# MASTER PROCESSOR
+# =========================================================
+
+def process_statement(file):
+
+    df = parse_pdf(file)
+
+    if df.empty:
+        return pd.DataFrame(columns=REQUIRED_COLUMNS)
+
+    df = remove_duplicates(df)
+    df = detect_income_expense(df)
+    df = classify_transactions(df)
+
+    return ensure_schema(df)
+
+
+# =========================================================
+# UI
+# =========================================================
+
+uploaded_files = st.file_uploader(
+    "Upload Bank Statements",
+    type=["pdf"],
+    accept_multiple_files=True
+)
+
+all_data = []
+
+if uploaded_files:
+
+    with st.spinner("Analyzing statements with AI..."):
+
+        for file in uploaded_files:
+            df = process_statement(file)
+
+            if not df.empty:
+                df["Source"] = file.name
+                all_data.append(df)
+
+    if all_data:
+
+        final_df = pd.concat(all_data)
+
+        st.subheader("Transactions")
+        st.dataframe(final_df, use_container_width=True)
+
+        st.subheader("Category Summary")
+
+        summary = (
+            final_df.groupby("Category")["Amount"]
+            .sum()
+            .reset_index()
+        )
+
+        st.dataframe(summary)
+
+        final_df["Month"] = pd.to_datetime(final_df["Date"]).dt.to_period("M")
+
+        st.subheader("Monthly Cashflow")
+        monthly = final_df.groupby("Month")["Amount"].sum().reset_index()
+        st.dataframe(monthly)
+
+        # Export
+        output_file = "expense_report.xlsx"
+        final_df.to_excel(output_file, index=False)
+
+        with open(output_file, "rb") as f:
+            st.download_button(
+                "Download Excel Report",
+                f,
+                file_name=output_file
+            )
+
+    else:
+        st.warning("No transactions detected.")
