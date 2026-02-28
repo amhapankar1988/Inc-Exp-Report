@@ -9,4 +9,5 @@ langchain-ibm>=0.3.0
 thefuzz==0.22.1
 python-Levenshtein==0.25.1
 plotly==5.20.0  # For better spending insights/charts
-pydantic==2.6.4 # For data validation
+pydantic
+
