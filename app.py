@@ -25,7 +25,6 @@ def get_llm():
 
 # --- 2. ENHANCED CLASSIFICATION ENGINE ---
 def classify_transactions(df, llm):
-    # Rule-based mapping for Canadian Merchants & Scotiabank specific codes
     mapping = {
         'Salary/Wages': ['payroll', 'salary', 'direct deposit', 'work inc'],
         'Government Benefits': ['gst', 'canada pro', 'ei benefit', 'tax refund', 'social security', 'provincial payment'],
@@ -43,7 +42,6 @@ def classify_transactions(df, llm):
     }
 
     def get_category(row):
-        # Scan both Description and Sub-description
         text = (str(row.get('Description', '')) + " " + str(row.get('Sub-description', ''))).lower()
         for category, keywords in mapping.items():
             if any(k in text for k in keywords):
@@ -51,48 +49,29 @@ def classify_transactions(df, llm):
         return "Uncategorized"
 
     df['Category'] = df.apply(get_category, axis=1)
-    
-    # Optional: Send truly unknown items to AI
-    uncat_mask = df['Category'] == "Uncategorized"
-    if uncat_mask.any():
-        unique_uncat = df[uncat_mask]['Description'].unique()[:20]
-        try:
-            prompt = f"Categorize these merchants into: {list(mapping.keys())}. List: {unique_uncat}. Format: Merchant | Category"
-            res = llm.invoke(prompt)
-            ai_map = {l.split('|')[0].strip(): l.split('|')[1].strip() for l in res.content.split('\n') if '|' in l}
-            df.loc[uncat_mask, 'Category'] = df['Description'].map(ai_map).fillna('Misc. Expenses')
-        except:
-            df.loc[uncat_mask, 'Category'] = 'Misc. Expenses'
-            
     return df
 
 # --- 3. DATA NORMALIZATION ---
 def standardize_df(df, filename):
+    # Clean column names
     df.columns = [str(c).strip() for c in df.columns]
-    low_cols = [c.lower() for c in df.columns]
-    
-    # Identify Scotiabank Visa (Signs are flipped in CSVs)
     is_visa = "visa" in filename.lower() or "scene" in filename.lower()
 
-    mapping = {
-        'date': ['Date'],
-        'description': ['Description'],
-        'sub-description': ['Sub-description'],
-        'amount': ['Amount']
-    }
+    # Rename map for flexibility
+    rename_map = {}
+    for col in df.columns:
+        c_low = col.lower()
+        if 'date' in c_low: rename_map[col] = 'Date'
+        elif 'sub-description' in c_low: rename_map[col] = 'Sub-description'
+        elif 'description' in c_low: rename_map[col] = 'Description'
+        elif 'amount' in c_low: rename_map[col] = 'Amount'
     
-    new_cols = {}
-    for standard, synonyms in mapping.items():
-        for col in df.columns:
-            if col in synonyms: new_cols[col] = standard.capitalize()
-    
-    df = df.rename(columns=new_cols)
+    df = df.rename(columns=rename_map)
     
     if 'Amount' in df.columns:
         df['Amount'] = df['Amount'].astype(str).replace(r'[\$,]', '', regex=True)
         df['Amount'] = df['Amount'].replace(r'\((.*)\)', r'-\1', regex=True)
         df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
-        # Normalize Visa: Spending (+) becomes Outflow (-), Payments (-) become Inflow (+)
         if is_visa:
             df['Amount'] = df['Amount'] * -1
             
@@ -103,9 +82,9 @@ def standardize_df(df, filename):
 
 # --- 4. UI DASHBOARD ---
 st.set_page_config(page_title="Canada AI Finance", layout="wide")
-st.title("🇨🇦 Enhanced Canadian Bank Multi-Statement Analyzer")
+st.title("🇨🇦 Canadian Bank Statement Intelligence")
 
-files = st.file_uploader("Upload Statements (Scotiabank, BMO, RBC, etc.)", type=["pdf", "csv", "xlsx"], accept_multiple_files=True)
+files = st.file_uploader("Upload Statements", type=["pdf", "csv", "xlsx"], accept_multiple_files=True)
 
 if files:
     if st.button("🚀 Run AI Analysis"):
@@ -118,11 +97,19 @@ if files:
                 if ext in ['csv', 'xlsx', 'xls']:
                     df = pd.read_csv(file) if ext == 'csv' else pd.read_excel(file)
                 else:
+                    # PDF Table Extraction with enhanced error handling
                     with pdfplumber.open(file) as pdf:
                         text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
                         res = llm.invoke(f"Extract transactions from: {text[:4000]}. Format: Date | Description | Amount")
-                        rows = [l.split('|') for l in res.content.split('\n') if '|' in l and '---' not in l]
-                        df = pd.DataFrame([r[1:4] for r in rows[1:]], columns=['Date','Description','Amount'])
+                        
+                        raw_rows = []
+                        for line in res.content.split('\n'):
+                            if '|' in line and '---' not in line:
+                                parts = [p.strip() for p in line.split('|') if p.strip()]
+                                if len(parts) >= 3: # Ensure we have at least 3 pieces of data
+                                    raw_rows.append(parts[:3]) # Take only the first 3 columns
+                        
+                        df = pd.DataFrame(raw_rows, columns=['Date','Description','Amount'])
                 
                 df = standardize_df(df, file.name)
                 df = classify_transactions(df, llm)
@@ -133,39 +120,39 @@ if files:
             master_df = master_df.dropna(subset=['Amount', 'Date'])
             master_df['Month-Year'] = master_df['Date'].dt.strftime('%Y-%m')
             
-            # --- TABS FOR OUTPUT ---
-            tab1, tab2, tab3 = st.tabs(["📊 Summary Report", "📝 All Transactions", "📥 Export"])
+            # --- 5. ENHANCED SUMMARY LOGIC ---
+            pivot_summary = master_df.pivot_table(
+                index='Category', 
+                columns='Month-Year', 
+                values='Amount', 
+                aggfunc='sum', 
+                fill_value=0
+            )
+
+            tab1, tab2, tab3 = st.tabs(["📊 Monthly Summary", "📝 All Transactions", "📥 Export Report"])
 
             with tab1:
-                st.subheader("Monthly Category Breakdown")
-                pivot_summary = master_df.pivot_table(
-                    index='Category', 
-                    columns='Month-Year', 
-                    values='Amount', 
-                    aggfunc='sum', 
-                    fill_value=0
-                )
+                st.subheader("Spending & Income by Category")
                 st.dataframe(pivot_summary.style.format("${:,.2f}"), use_container_width=True)
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write("### Total Inflow/Outflow")
-                    summary = master_df.groupby('Month-Year').agg(
-                        Income=('Amount', lambda x: x[x > 0].sum()),
-                        Expenses=('Amount', lambda x: abs(x[x < 0].sum()))
-                    )
-                    st.bar_chart(summary)
+                # Monthly Inflow/Outflow Graph
+                st.write("### Cash Flow Trend")
+                trend = master_df.groupby('Month-Year').agg(
+                    Inflow=('Amount', lambda x: x[x > 0].sum()),
+                    Outflow=('Amount', lambda x: abs(x[x < 0].sum()))
+                )
+                st.bar_chart(trend)
 
             with tab2:
-                st.subheader("Unified Transaction Log")
+                st.subheader("Transaction History")
                 st.dataframe(master_df[['Date', 'Description', 'Category', 'Amount', 'Source']], use_container_width=True)
 
             with tab3:
-                # Prepare Excel with Multiple Sheets
                 output = io.BytesIO()
+                # Create Excel with two sheets
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     master_df.to_excel(writer, index=False, sheet_name='All_Transactions')
-                    pivot_summary.to_excel(writer, sheet_name='Monthly_Category_Summary')
+                    pivot_summary.to_excel(writer, sheet_name='Category_Monthly_Summary')
                 
-                st.success("Report generated with Category Summary tab!")
-                st.download_button("📥 Download Excel Report", output.getvalue(), "Scotiabank_Enhanced_Report.xlsx")
+                st.success("Analysis complete. Download your multi-tab report below.")
+                st.download_button("📥 Download Excel Report", output.getvalue(), "Financial_Summary_Report.xlsx")
