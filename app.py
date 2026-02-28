@@ -94,61 +94,71 @@ def categorize_data(df, model):
 
 def process_pdf(file):
     all_rows = []
-    # Enhanced Regex to capture dates like "Apr 04", descriptions, and amounts
-    # It accounts for the multi-line nature of Triangle descriptions
-    line_regex = re.compile(r"([A-Z][a-z]{2}\s\d{2})\s+([A-Z][a-z]{2}\s\d{2})\s+(.*?)\s+(-?\$?[\d,]+\.\d{2})")
+    # Regex tailored for Triangle: Date | Date | Description | Amount 
+    line_regex = re.compile(r"([A-Z][a-z]{2}\s\d{2})\s+([A-Z][a-z]{2}\s\d{2})\s+(.*?)\s+(-?[\d,]+\.\d{2})")
 
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            # STRATEGY 1: Layout-Aware Table Extraction
-            # We use 'text' as the strategy because Triangle statements 
-            # often lack visible vertical lines.
-            tables = page.extract_tables(table_settings={
-                "vertical_strategy": "text",
+            # Revised Table Settings to avoid TypeError [cite: 56]
+            # Triangle tables often lack clear vertical lines, so we use 'text' for horizontal 
+            # but rely on visual layout for column separation. [cite: 51, 108]
+            ts = {
+                "vertical_strategy": "lines", 
                 "horizontal_strategy": "text",
-                "snap_tol": 4, # Helps join nearby text into one cell
-                "join_tolerance": 3
-            })
+                "snap_tolerance": 4,
+                "join_tolerance": 3,
+            }
+            
+            tables = page.extract_tables(table_settings=ts)
             
             for table in tables:
                 for row in table:
-                    # Filter out empty cells and clean whitespace
+                    # Clean the row of None values and extra newlines 
                     clean_row = [str(c).replace('\n', ' ').strip() for c in row if c]
                     
-                    # Target rows that look like transactions (Date, Date/Desc, Amount)
+                    # Target rows with at least 3 columns (Date, Desc, Amount) [cite: 51, 143]
                     if len(clean_row) >= 3:
-                        # Triangle often puts Date in col 0, 
-                        # Posting Date + Description in col 1, and Amount in col 2
-                        date = clean_row[0]
-                        desc = clean_row[1]
-                        amount = clean_row[-1]
+                        date_val = clean_row[0]
+                        # Often col 1 is Posting Date and col 2 is Description [cite: 56]
+                        # We merge them if needed or grab the last as amount [cite: 56, 113]
+                        desc_val = clean_row[1] if len(clean_row) == 3 else " ".join(clean_row[1:-1])
+                        amount_val = clean_row[-1]
                         
-                        # Validate that the amount looks like a number
-                        if re.search(r'\d+\.\d{2}', amount):
-                            all_rows.append([date, desc, amount])
+                        # Validate that the amount column actually contains a price [cite: 51, 56]
+                        if re.search(r'\d+\.\d{2}', amount_val):
+                            all_rows.append([date_val, desc_val, amount_val])
 
-            # STRATEGY 2: Visual Line Fallback
-            # If tables missed something (like the Returns section), we scrape by visual line
-            if not all_rows or page.page_number >= 2:
-                text = page.extract_text(x_tolerance=2, y_tolerance=2)
-                if text:
-                    for line in text.split('\n'):
-                        # Apply regex to find transactions not caught in table grid
-                        match = line_regex.search(line)
-                        if match:
-                            # groups: 0=Trans Date, 1=Posting Date, 2=Description, 3=Amount
-                            all_rows.append([match.group(1), match.group(3), match.group(4)])
+            # Strategy 2: Text Scrape for the "Returns" and "Interest" sections [cite: 53, 113]
+            # Sometimes these aren't in a standard grid [cite: 53, 116]
+            text = page.extract_text()
+            if text:
+                for line in text.split('\n'):
+                    # Catch Interest Charges specifically [cite: 113]
+                    if "INTEREST CHARGES" in line.upper():
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            all_rows.append([parts[0], "INTEREST CHARGES", parts[-1]])
+                    
+                    # Catch the Purchases that Regex can see 
+                    match = line_regex.search(line)
+                    if match:
+                        all_rows.append([match.group(1), match.group(3), match.group(4)])
                         
     df = pd.DataFrame(all_rows, columns=["Date", "Description", "Amount"])
     
-    # Cleaning the data
-    # 1. Remove rows that are clearly headers
-    noise = ["date", "description", "amount", "total", "posting", "subtotal"]
-    df = df[~df['Description'].str.lower().str.contains('|'.join(noise), na=False)]
+    # Final Data Cleaning for Triangle Formats [cite: 8, 51]
+    def clean_triangle_amt(val):
+        # Handle the $1,234.56- format for returns 
+        s = str(val).replace('$', '').replace(',', '').strip()
+        if s.endswith('-'): s = '-' + s[:-1]
+        try: return float(s)
+        except: return 0.0
+
+    df["Amount"] = df["Amount"].apply(clean_triangle_amt)
     
-    # 2. Specifically capture "Interest Charges" and "Returns" from Triangle logic
-    # Triangle represents returns with a minus sign (e.g., -0.63) 
-    df["Amount"] = df["Amount"].apply(lambda x: str(x).replace('$', '').replace(',', '').strip())
+    # Filter out rows that are actually page footers or headers [cite: 43, 97, 148]
+    noise = ["date", "description", "amount", "total", "posting", "page", "statement"]
+    df = df[~df['Description'].str.lower().str.contains('|'.join(noise), na=False)]
     
     return df
 
