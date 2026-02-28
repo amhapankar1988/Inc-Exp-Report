@@ -94,29 +94,62 @@ def categorize_data(df, model):
 
 def process_pdf(file):
     all_rows = []
-    line_regex = re.compile(r"(\d{1,4}[/-]\d{1,2}[/-]?\d{0,4}|[A-Z][a-z]{2}\s\d{1,2})\s+(.*?)\s+(-?\$?[\d,]+\.\d{2})")
+    # Enhanced Regex to capture dates like "Apr 04", descriptions, and amounts
+    # It accounts for the multi-line nature of Triangle descriptions
+    line_regex = re.compile(r"([A-Z][a-z]{2}\s\d{2})\s+([A-Z][a-z]{2}\s\d{2})\s+(.*?)\s+(-?\$?[\d,]+\.\d{2})")
 
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
+            # STRATEGY 1: Layout-Aware Table Extraction
+            # We use 'text' as the strategy because Triangle statements 
+            # often lack visible vertical lines.
+            tables = page.extract_tables(table_settings={
+                "vertical_strategy": "text",
+                "horizontal_strategy": "text",
+                "snap_tol": 4, # Helps join nearby text into one cell
+                "join_tolerance": 3
+            })
+            
             for table in tables:
                 for row in table:
-                    clean = [str(c).strip() for c in row if c and len(str(c).strip()) > 1]
-                    if len(clean) >= 3:
-                        all_rows.append([clean[0], clean[1], clean[-1]])
-            
-            if not all_rows:
-                text = page.extract_text()
+                    # Filter out empty cells and clean whitespace
+                    clean_row = [str(c).replace('\n', ' ').strip() for c in row if c]
+                    
+                    # Target rows that look like transactions (Date, Date/Desc, Amount)
+                    if len(clean_row) >= 3:
+                        # Triangle often puts Date in col 0, 
+                        # Posting Date + Description in col 1, and Amount in col 2
+                        date = clean_row[0]
+                        desc = clean_row[1]
+                        amount = clean_row[-1]
+                        
+                        # Validate that the amount looks like a number
+                        if re.search(r'\d+\.\d{2}', amount):
+                            all_rows.append([date, desc, amount])
+
+            # STRATEGY 2: Visual Line Fallback
+            # If tables missed something (like the Returns section), we scrape by visual line
+            if not all_rows or page.page_number >= 2:
+                text = page.extract_text(x_tolerance=2, y_tolerance=2)
                 if text:
                     for line in text.split('\n'):
+                        # Apply regex to find transactions not caught in table grid
                         match = line_regex.search(line)
-                        if match: all_rows.append(list(match.groups()))
+                        if match:
+                            # groups: 0=Trans Date, 1=Posting Date, 2=Description, 3=Amount
+                            all_rows.append([match.group(1), match.group(3), match.group(4)])
                         
     df = pd.DataFrame(all_rows, columns=["Date", "Description", "Amount"])
-    # Remove obvious headers/footers
-    df = df[~df['Description'].str.lower().str.contains("balance|transaction|date|description|amount", na=False)]
-    # Handle Canadian negative format ($10.00-)
-    df["Amount"] = df["Amount"].apply(lambda x: "-" + re.sub(r'[^\d.]', '', x) if str(x).endswith('-') else re.sub(r'[^\d.-]', '', str(x)))
+    
+    # Cleaning the data
+    # 1. Remove rows that are clearly headers
+    noise = ["date", "description", "amount", "total", "posting", "subtotal"]
+    df = df[~df['Description'].str.lower().str.contains('|'.join(noise), na=False)]
+    
+    # 2. Specifically capture "Interest Charges" and "Returns" from Triangle logic
+    # Triangle represents returns with a minus sign (e.g., -0.63) 
+    df["Amount"] = df["Amount"].apply(lambda x: str(x).replace('$', '').replace(',', '').strip())
+    
     return df
 
 # =========================================================
