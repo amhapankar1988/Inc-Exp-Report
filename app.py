@@ -28,13 +28,19 @@ def get_ai_model():
         url = "https://ca-tor.ml.cloud.ibm.com"
 
         return ChatWatsonx(
-            model_id="ibm/granite-3-8b-instruct",
+            # UPDATED: Using the recommended successor model
+            model_id="ibm/granite-4-h-small", 
             url=url,
             project_id=project_id,
             apikey=api_key,
-            params={GenParams.DECODING_METHOD: "greedy", GenParams.MAX_NEW_TOKENS: 500, GenParams.TEMPERATURE: 0},
+            params={
+                GenParams.DECODING_METHOD: "greedy", 
+                GenParams.MAX_NEW_TOKENS: 500, 
+                GenParams.TEMPERATURE: 0
+            },
         )
     except Exception as e:
+        st.error(f"AI Config Error: {e}")
         return None
 
 # =========================================================
