@@ -163,11 +163,24 @@ def process_pdf(file):
     
     return df
 
+def process_excel_csv(file):
+    """Fixes the ValueError by explicitly handling the file extension and buffer."""
+    filename = file.name.lower()
+    try:
+        if filename.endswith('.csv'):
+            return pd.read_csv(file)
+        elif filename.endswith(('.xls', '.xlsx')):
+            # Using openpyxl as the engine for modern Excel files
+            return pd.read_excel(io.BytesIO(file.getvalue()), engine='openpyxl')
+    except Exception as e:
+        st.error(f"Error reading {filename}: {e}")
+    return pd.DataFrame()
+
 # =========================================================
 # 4. UI & WORKFLOW
 # =========================================================
 
-st.title("🏦 Smart AI Expense Analyzer (Toronto Region)")
+st.title("🏦 Smart AI Expense Analyzer")
 
 # Sidebar: Category Teacher
 with st.sidebar:
