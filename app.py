@@ -2,7 +2,11 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
-from collections import defaultdict
+import os
+import joblib
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 from ibm_watsonx_ai.foundation_models import ModelInference
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
@@ -21,120 +25,179 @@ def get_ai_model():
         api_key = st.secrets["WATSONX_APIKEY"].strip()
         project_id = st.secrets["WATSONX_PROJECT_ID"].strip()
 
-        parameters = {
-            GenParams.DECODING_METHOD: "greedy",
-            GenParams.MAX_NEW_TOKENS: 600,
-            GenParams.TEMPERATURE: 0,
-        }
-
         model = ModelInference(
-            model_id="ibm/granite-3-8b-instruct",
+            model_id="ibm/granite-4-h-small",
             credentials={
                 "apikey": api_key,
                 "url": "https://ca-tor.ml.cloud.ibm.com",
             },
             project_id=project_id,
-            params=parameters
+            params={
+                GenParams.DECODING_METHOD: "greedy",
+                GenParams.MAX_NEW_TOKENS: 500,
+                GenParams.TEMPERATURE: 0.2,
+            }
         )
-
         return model
-
     except Exception as e:
         st.error(f"AI setup failed: {e}")
         return None
 
 
 # =========================================================
-# CATEGORY ENGINE (FAST RULE ENGINE)
+# MERCHANT MEMORY SYSTEM
 # =========================================================
-category_rules = {
-    "starbucks": "Food and Dining",
-    "tim hortons": "Food and Dining",
-    "uber": "Transportation",
-    "lyft": "Transportation",
-    "metro": "Groceries",
-    "walmart": "Shopping",
-    "amazon": "Shopping",
-    "netflix": "Entertainment",
-    "spotify": "Entertainment",
-    "shell": "Transportation",
-    "esso": "Transportation",
-}
+MEMORY_FILE = "merchant_memory.pkl"
 
 
-def rule_based_category(desc):
-    desc = desc.lower()
+def load_memory():
+    if os.path.exists(MEMORY_FILE):
+        return joblib.load(MEMORY_FILE)
+    return {}
 
-    for key, val in category_rules.items():
-        if key in desc:
-            return val
 
-    if "interest" in desc:
-        return "Interest Charge"
+def save_memory(memory):
+    joblib.dump(memory, MEMORY_FILE)
 
-    if "fee" in desc:
-        return "Fees and Charges"
 
-    if "deposit" in desc:
-        return "Deposits"
+merchant_memory = load_memory()
+
+
+def memory_categorize(description):
+    if not merchant_memory:
+        return None
+
+    merchants = list(merchant_memory.keys())
+
+    vectorizer = TfidfVectorizer().fit(merchants + [description])
+    vectors = vectorizer.transform(merchants + [description])
+
+    similarity = cosine_similarity(vectors[-1], vectors[:-1])
+
+    best_match_index = similarity.argmax()
+    score = similarity[0][best_match_index]
+
+    if score > 0.75:
+        merchant = merchants[best_match_index]
+        return merchant_memory[merchant]
 
     return None
 
 
 # =========================================================
-# TEXT EXTRACTION
+# RULE ENGINE
 # =========================================================
-def extract_text_from_pdf(file):
-    text = ""
+rules = {
+    "uber": "Transportation",
+    "lyft": "Transportation",
+    "amazon": "Shopping",
+    "walmart": "Shopping",
+    "costco": "Groceries",
+    "metro": "Groceries",
+    "tim hortons": "Food and Dining",
+    "starbucks": "Food and Dining",
+    "netflix": "Entertainment",
+    "spotify": "Entertainment",
+}
 
+
+def categorize(desc):
+    desc_lower = desc.lower()
+
+    memory_cat = memory_categorize(desc_lower)
+    if memory_cat:
+        return memory_cat
+
+    for key in rules:
+        if key in desc_lower:
+            return rules[key]
+
+    if "interest" in desc_lower:
+        return "Interest Charge"
+
+    if "fee" in desc_lower:
+        return "Fees and Charges"
+
+    if "deposit" in desc_lower:
+        return "Deposits"
+
+    return "Other"
+
+
+# =========================================================
+# BANK DETECTION
+# =========================================================
+def detect_bank(text):
+    text = text.lower()
+
+    if "royal bank" in text or "rbc" in text:
+        return "RBC"
+    if "td canada trust" in text or "toronto dominion" in text:
+        return "TD"
+    if "scotiabank" in text:
+        return "Scotiabank"
+    if "cibc" in text:
+        return "CIBC"
+    if "bank of montreal" in text or "bmo" in text:
+        return "BMO"
+    if "american express" in text or "amex" in text:
+        return "AMEX"
+
+    return "Generic"
+
+
+# =========================================================
+# PDF TEXT EXTRACTION
+# =========================================================
+def extract_text(file):
+    text = ""
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            content = page.extract_text()
-            if content:
-                text += content + "\n"
-
+            t = page.extract_text()
+            if t:
+                text += t + "\n"
     return text
 
 
 # =========================================================
-# REGEX TRANSACTION PARSER (VERY IMPORTANT)
+# BANK PARSER
 # =========================================================
-def regex_extract_transactions(text):
-    pattern = r'(\d{2}[-/]\d{2}[-/]\d{2,4})\s+(.*?)\s+(-?\$?\d+\.\d{2})'
+def parse_transactions(text, bank):
+
+    patterns = {
+        "RBC": r'(\d{2}/\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})',
+        "TD": r'(\d{2}-\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})',
+        "Scotiabank": r'(\d{2}\s\w{3})\s+(.*?)\s+(-?\$?\d+\.\d{2})',
+        "CIBC": r'(\d{2}/\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})',
+        "BMO": r'(\d{2}/\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})',
+        "AMEX": r'(\w{3}\s\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})',
+        "Generic": r'(\d{2}[-/]\d{2})\s+(.*?)\s+(-?\$?\d+\.\d{2})'
+    }
+
+    pattern = patterns.get(bank, patterns["Generic"])
     matches = re.findall(pattern, text)
 
     data = []
-
     for date, desc, amount in matches:
-        cat = rule_based_category(desc) or "Other"
-        data.append([date, desc, amount, cat])
+        data.append([date, desc, amount, "Other"])
 
-    df = pd.DataFrame(
-        data,
-        columns=["Date", "Description", "Amount", "Category"]
-    )
-
-    return df
+    return pd.DataFrame(data, columns=["Date", "Description", "Amount", "Category"])
 
 
 # =========================================================
-# AI CLASSIFIER (USED ONLY WHEN NEEDED)
+# AI CATEGORY IMPROVER
 # =========================================================
-def ai_classify_remaining(df, model, context):
+def ai_refine_categories(df, model):
 
-    uncategorized = df[df["Category"] == "Other"]
+    unknown = df[df["Category"] == "Other"]
 
-    if uncategorized.empty:
+    if unknown.empty:
         return df
 
-    text_block = "\n".join(
-        uncategorized["Description"].astype(str).tolist()
-    )
+    text = "\n".join(unknown["Description"].tolist())
 
     prompt = f"""
-You categorize bank transactions in Canada.
-
-Categories:
+Classify bank transactions into categories:
 Food and Dining
 Groceries
 Transportation
@@ -147,13 +210,10 @@ Interest Charge
 Health and Fitness
 Other
 
-Rules:
-{context}
-
 Transactions:
-{text_block}
+{text}
 
-Return format:
+Return:
 Description | Category
 """
 
@@ -162,33 +222,100 @@ Description | Category
         result = response["results"][0]["generated_text"]
 
         mapping = {}
-
         for line in result.split("\n"):
             if "|" in line:
                 parts = line.split("|")
-                if len(parts) >= 2:
-                    mapping[parts[0].strip()] = parts[1].strip()
+                mapping[parts[0].strip()] = parts[1].strip()
 
         df["Category"] = df.apply(
             lambda row: mapping.get(row["Description"], row["Category"]),
             axis=1
         )
-
-    except Exception as e:
-        st.warning("AI categorization fallback used")
+    except:
+        pass
 
     return df
 
 
 # =========================================================
+# INTELLIGENCE FEATURES
+# =========================================================
+subscription_keywords = [
+    "netflix", "spotify", "apple", "google",
+    "prime", "icloud", "adobe", "chatgpt"
+]
+
+
+def detect_subscriptions(df):
+    df["Subscription"] = df["Description"].str.lower().apply(
+        lambda x: any(word in x for word in subscription_keywords)
+    )
+    return df
+
+
+salary_keywords = ["payroll", "salary", "deposit", "income"]
+
+
+def detect_salary(df):
+    df["Salary"] = df["Description"].str.lower().apply(
+        lambda x: any(word in x for word in salary_keywords)
+    )
+    return df
+
+
+def detect_recurring(df):
+    recurring = df.groupby("Description").size()
+    recurring = recurring[recurring > 2].index
+    df["Recurring"] = df["Description"].isin(recurring)
+    return df
+
+
+def monthly_spending_trend(df):
+    try:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df["Month"] = df["Date"].dt.to_period("M")
+
+        trend = (
+            df[df["Amount"] < 0]
+            .groupby("Month")["Amount"]
+            .sum()
+            .abs()
+        )
+        return trend
+    except:
+        return None
+
+
+# =========================================================
+# LEARNING SYSTEM
+# =========================================================
+def learn_merchants(df):
+    global merchant_memory
+
+    for _, row in df.iterrows():
+        desc = row["Description"].lower()
+        cat = row["Category"]
+
+        if cat != "Other":
+            merchant_memory[desc] = cat
+
+    save_memory(merchant_memory)
+
+
+# =========================================================
 # MAIN PROCESSOR
 # =========================================================
-def process_file(file, model, context):
+def process_file(file, model):
+
     name = file.name.lower()
 
     if name.endswith("pdf"):
-        raw_text = extract_text_from_pdf(file)
-        df = regex_extract_transactions(raw_text)
+        text = extract_text(file)
+        bank = detect_bank(text)
+
+        st.sidebar.info(f"Detected Bank: {bank}")
+
+        df = parse_transactions(text, bank)
 
     elif name.endswith("csv"):
         df = pd.read_csv(file)
@@ -196,7 +323,6 @@ def process_file(file, model, context):
     else:
         df = pd.read_excel(file)
 
-    # Clean amounts
     df["Amount"] = (
         df["Amount"]
         .astype(str)
@@ -205,7 +331,9 @@ def process_file(file, model, context):
 
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
 
-    df = ai_classify_remaining(df, model, context)
+    df["Category"] = df["Description"].apply(categorize)
+
+    df = ai_refine_categories(df, model)
 
     return df
 
@@ -213,22 +341,10 @@ def process_file(file, model, context):
 # =========================================================
 # UI
 # =========================================================
-st.title("🏦 Universal Bank AI Analyzer (Pro Version)")
-
-if "context" not in st.session_state:
-    st.session_state.context = ""
-
-with st.sidebar:
-    st.header("AI Learning Rules")
-
-    rule = st.text_area("Example: Costco is Groceries")
-
-    if st.button("Save Rule"):
-        st.session_state.context += f"\n{rule}"
-        st.success("AI learned new rule")
+st.title("🏦 Universal Bank AI Analyzer — Enterprise AI Version")
 
 files = st.file_uploader(
-    "Upload statements",
+    "Upload bank statements",
     type=["pdf", "csv", "xlsx"],
     accept_multiple_files=True
 )
@@ -236,41 +352,47 @@ files = st.file_uploader(
 if files:
     model = get_ai_model()
 
-    results = []
+    if not model:
+        st.stop()
 
+    results = []
     progress = st.progress(0)
 
-    for i, f in enumerate(files):
-        with st.spinner(f"Processing {f.name}"):
-            df = process_file(f, model, st.session_state.context)
+    for i, file in enumerate(files):
+        with st.spinner(f"Processing {file.name}"):
+            df = process_file(file, model)
             results.append(df)
 
         progress.progress((i + 1) / len(files))
 
     final_df = pd.concat(results)
 
-    st.subheader("Transactions")
-    st.dataframe(final_df, use_container_width=True)
+    if final_df.empty:
+        st.warning("No transactions detected.")
+        st.stop()
 
-    # =========================================================
-    # ANALYTICS
-    # =========================================================
+    # Intelligence
+    final_df = detect_subscriptions(final_df)
+    final_df = detect_salary(final_df)
+    final_df = detect_recurring(final_df)
+
+    # Learning
+    learn_merchants(final_df)
+
+    st.subheader("Transactions")
+    st.dataframe(final_df, width="stretch")
+
+    # Metrics
     col1, col2, col3 = st.columns(3)
 
-    total_spent = final_df[final_df["Amount"] < 0]["Amount"].sum()
-    total_income = final_df[final_df["Amount"] > 0]["Amount"].sum()
+    expenses = final_df[final_df["Amount"] < 0]["Amount"].sum()
+    income = final_df[final_df["Amount"] > 0]["Amount"].sum()
 
-    with col1:
-        st.metric("Total Spending", f"${abs(total_spent):,.2f}")
+    col1.metric("Total Spending", f"${abs(expenses):,.2f}")
+    col2.metric("Total Income", f"${income:,.2f}")
+    col3.metric("Net", f"${income + expenses:,.2f}")
 
-    with col2:
-        st.metric("Total Income", f"${total_income:,.2f}")
-
-    with col3:
-        st.metric("Net", f"${(total_income + total_spent):,.2f}")
-
-    st.subheader("Spending by Category")
-
+    # Spending chart
     spending = (
         final_df[final_df["Amount"] < 0]
         .groupby("Category")["Amount"]
@@ -279,4 +401,45 @@ if files:
         .sort_values(ascending=False)
     )
 
-    st.bar_chart(spending)
+    st.subheader("Spending by Category")
+
+    if not spending.empty:
+        st.bar_chart(spending)
+    else:
+        st.info("No spending data available.")
+
+    # Monthly trend
+    trend = monthly_spending_trend(final_df)
+
+    if trend is not None and not trend.empty:
+        st.subheader("Monthly Spending Trend")
+        st.line_chart(trend)
+
+    # Subscriptions
+    st.subheader("Subscriptions Detected")
+    subs = final_df[final_df["Subscription"]]
+    st.dataframe(subs[["Date", "Description", "Amount"]], width="stretch")
+
+    # Recurring
+    st.subheader("Recurring Payments")
+    rec = final_df[final_df["Recurring"]]
+    st.dataframe(rec[["Date", "Description", "Amount"]], width="stretch")
+
+    # AI Advisor
+    st.subheader("AI Financial Advisor")
+
+    if st.button("Generate Financial Insights"):
+        sample = final_df.head(50).to_string()
+
+        prompt = f"""
+Analyze these bank transactions and provide financial advice:
+
+{sample}
+"""
+
+        try:
+            response = model.generate(prompt)
+            insights = response["results"][0]["generated_text"]
+            st.write(insights)
+        except:
+            st.warning("AI insights unavailable.")
