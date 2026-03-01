@@ -2,5 +2,5 @@ streamlit
 pdfplumber
 pandas
 openpyxl
-langchain-ibm
+langchain-ibm>=0.3.0
 ibm-watsonx-ai
