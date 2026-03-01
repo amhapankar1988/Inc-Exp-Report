@@ -3,5 +3,6 @@ pdfplumber
 pandas
 ibm-watsonx-ai
 openpyxl
+scikit-learn
+joblib
 numpy
-python-dateutil
