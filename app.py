@@ -7,7 +7,7 @@ from langchain_ibm import WatsonxLLM
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 
 # =========================================================
-# 1. AI CONFIGURATION (Fixed Indentation & Redundant Brackets)
+# 1. AI CONFIGURATION (Fixed Indentation & API Logic)
 # =========================================================
 def get_ai_model():
     try:
@@ -15,14 +15,14 @@ def get_ai_model():
         project_id = st.secrets["WATSONX_PROJECT_ID"].strip()
         url = "https://ca-tor.ml.cloud.ibm.com"
 
-        # Define parameters inside the function scope
+        # Define parameters correctly
         parameters = {
             GenParams.DECODING_METHOD: "greedy",
             GenParams.MAX_NEW_TOKENS: 1000,
             GenParams.TEMPERATURE: 0,
         }
 
-        # Return the model correctly
+        # Use WatsonxLLM for base models to avoid 'function' errors
         return WatsonxLLM(
             model_id="meta-llama/llama-3-1-8b",
             url=url,
@@ -35,7 +35,7 @@ def get_ai_model():
         return None
 
 # =========================================================
-# 2. DATA EXTRACTION LOGIC
+# 2. DATA EXTRACTION & CLASSIFICATION
 # =========================================================
 
 def extract_raw_text(file):
@@ -51,7 +51,7 @@ def extract_raw_text(file):
         else:
             text_content = pd.read_excel(file).to_string()
     except Exception as e:
-        st.error(f"File reading error: {e}")
+        st.error(f"Error reading {filename}: {e}")
     return text_content
 
 def ai_classify_transactions(raw_text, model, user_context=""):
@@ -62,14 +62,13 @@ def ai_classify_transactions(raw_text, model, user_context=""):
         "Withdrawal", "Deposits", "Other"
     ]
     
-    # Llama 3.1 Prompt Template
+    # Prompt structured for Llama-3-1 Base
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are a Canadian banking expert. Extract all transactions from the text into a table.
-Columns: Date | Description | Amount | Category
+You are a Canadian banking expert. Extract transactions from the text into a table.
+Format: Date | Description | Amount | Category
 Rules:
 - Categories: {", ".join(categories)}
-- Debits (spending) are negative numbers.
-- Credits (income/deposits) are positive numbers.
+- Spending is negative (e.g., -50.00). Deposits are positive.
 - {user_context}
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 Statement Text:
@@ -79,10 +78,10 @@ Date | Description | Amount | Category
 """
     
     try:
-        # Get raw response from AI
+        # Get raw response string
         response = model.invoke(prompt) 
         
-        # Convert the AI's pipe-separated text into a DataFrame
+        # Parse text into DataFrame
         lines = response.strip().split('\n')
         data = []
         for line in lines:
@@ -93,7 +92,7 @@ Date | Description | Amount | Category
         
         return pd.DataFrame(data, columns=["Date", "Description", "Amount", "Category"])
     except Exception as e:
-        st.error(f"Classification failed: {e}")
+        st.error(f"AI Error: {e}")
         return pd.DataFrame()
 
 # =========================================================
@@ -108,48 +107,43 @@ if "context" not in st.session_state:
 
 with st.sidebar:
     st.header("🧠 AI Rules")
-    new_rule = st.text_area("Add custom categorization rule:")
-    if st.button("Update AI"):
+    new_rule = st.text_area("Example: 'Starbucks is Food and Dining'")
+    if st.button("Update Rules"):
         st.session_state.context += f" {new_rule}."
         st.success("Rule Saved")
 
-files = st.file_uploader("Upload Statements", type=["pdf", "csv", "xlsx"], accept_multiple_files=True)
+files = st.file_uploader("Upload Bank Statements", type=["pdf", "csv", "xlsx"], accept_multiple_files=True)
 
 if files:
-    model = get_ai_model()
-    if model:
-        all_dfs = []
+    ai_model = get_ai_model()
+    if ai_model:
+        all_results = []
         for f in files:
-            with st.spinner(f"Analyzing {f.name}..."):
-                text = extract_raw_text(f)
-                df = ai_classify_transactions(text, model, st.session_state.context)
+            with st.spinner(f"AI Analyzing {f.name}..."):
+                raw_text = extract_raw_text(f)
+                df = ai_classify_transactions(raw_text, ai_model, st.session_state.context)
                 if not df.empty: 
-                    all_dfs.append(df)
+                    all_results.append(df)
         
-        if all_dfs:
-            final_df = pd.concat(all_dfs, ignore_index=True)
+        if all_results:
+            final_df = pd.concat(all_results, ignore_index=True)
             
-            # Basic cleanup: remove currency symbols and convert to float
+            # Clean numeric data
             final_df["Amount"] = final_df["Amount"].astype(str).str.replace(r'[^\d.-]', '', regex=True)
             final_df["Amount"] = pd.to_numeric(final_df["Amount"], errors='coerce').fillna(0.0)
             
-            st.subheader("Categorized Transactions")
+            st.subheader("Classified Transactions")
             st.dataframe(final_df, use_container_width=True)
             
-            col1, col2 = st.columns(2)
-            with col1:
+            # Analytics
+            c1, c2 = st.columns(2)
+            with c1:
                 st.write("### Spending by Category")
-                spending_df = final_df[final_df["Amount"] < 0]
-                if not spending_df.empty:
-                    chart_data = spending_df.groupby("Category")["Amount"].sum().abs()
-                    st.bar_chart(chart_data)
-                else:
-                    st.info("No spending detected for chart.")
-                    
-            with col2:
-                st.write("### Summary Metrics")
+                spent = final_df[final_df["Amount"] < 0].groupby("Category")["Amount"].sum().abs()
+                st.bar_chart(spent)
+            with c2:
+                st.write("### Quick Stats")
+                total_spent = final_df[final_df["Amount"] < 0]["Amount"].sum()
+                st.metric("Total Expenses", f"${abs(total_spent):,.2f}")
                 fees = final_df[final_df["Category"].str.contains("Fee|NSF|Interest", case=False, na=False)]["Amount"].sum()
-                st.metric("Total Bank Fees/Interest", f"${abs(fees):,.2f}")
-                
-                total_in = final_df[final_df["Amount"] > 0]["Amount"].sum()
-                st.metric("Total Deposits", f"${total_in:,.2f}")
+                st.metric("Bank Fees", f"${abs(fees):,.2f}")
