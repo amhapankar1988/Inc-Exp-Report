@@ -16,17 +16,19 @@ def get_ai_model():
         url = "https://ca-tor.ml.cloud.ibm.com"
 
         # Correcting the class: Use WatsonxLLM for base models like llama-3-1-8b
-        return WatsonxLLM(
-            model_id="meta-llama/llama-3-1-8b", 
-            url=url,
-            project_id=project_id,
-            apikey=api_key,
-            params={
-                GenParams.DECODING_METHOD: "greedy",
-                GenParams.MAX_NEW_TOKENS: 1500,
-                GenParams.TEMPERATURE: 0,
-                GenParams.STOP_SEQUENCES: ["\n\n"] # Stop when double new-line occurs
-            },
+    parameters={
+        GenParams.DECODING_METHOD: "greedy",
+        GenParams.MAX_NEW_TOKENS: 1000,
+        GenParams.TEMPERATURE: 0,
+    }
+            # IMPORTANT: Use WatsonxLLM for base models like Llama 3.1 8B
+    return WatsonxLLM(
+        model_id="meta-llama/llama-3-1-8b",
+        url="https://ca-tor.ml.cloud.ibm.com",
+        project_id=st.secrets["WATSONX_PROJECT_ID"],
+        apikey=st.secrets["WATSONX_APIKEY"],
+        params=parameters
+    )
         )
     except Exception as e:
         st.error(f"Watsonx Config Error: {e}")
@@ -59,33 +61,26 @@ def ai_classify_transactions(raw_text, model, user_context=""):
     
     # Llama 3.1 Specific Prompt Template
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are a Canadian banking expert. Extract all transactions from the text into a table.
-Columns: Date | Description | Amount | Category
-Rules:
-- Categories: {", ".join(categories)}
-- Debits (spending) are negative numbers.
-- Credits (income/deposits) are positive numbers.
-- {user_context}
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-Statement Text:
-{raw_text[:4000]}
-<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-Date | Description | Amount | Category
-"""
+    You are a Canadian banking expert. Extract all transactions from the text into a table.
+    Columns: Date | Description | Amount | Category
+    Rules:
+    - Categories: {", ".join(categories)}
+    - Debits (spending) are negative numbers.
+    - Credits (income/deposits) are positive numbers.
+    - {user_context}
+    <|eot_id|><|start_header_id|>user<|end_header_id|>
+    Statement Text:
+    {raw_text[:4000]}
+    <|eot_id|><|start_header_id|>assistant<|end_header_id|>
+    Date | Description | Amount | Category
+    """
     
     try:
-        response = model.invoke(prompt)
-        lines = response.strip().split('\n')
-        data = []
-        for line in lines:
-            if '|' in line and "Date" not in line:
-                parts = [p.strip() for p in line.split('|')]
-                if len(parts) >= 4:
-                    data.append(parts[:4])
-        return pd.DataFrame(data, columns=["Date", "Description", "Amount", "Category"])
+        # This calls /text/generation directly
+        response = model.invoke(prompt) 
+        return response
     except Exception as e:
-        st.error(f"AI Extraction Failed: {e}")
-        return pd.DataFrame()
+        st.error(f"Classification failed: {e}")
 
 # =========================================================
 # 3. STREAMLIT UI
