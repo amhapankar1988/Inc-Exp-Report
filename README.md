@@ -10,39 +10,60 @@ license: apache-2.0
 header: mini
 ---
 
-# 🏦 Multi-Statement Finance Analyzer (Powered by watsonx.ai)
+Smart AI Expense Analyzer (Universal Canadian Edition)
+An intelligent Streamlit application designed to ingest unstructured financial data from all "Big 6" Canadian banks (RBC, TD, Scotiabank, BMO, CIBC, National Bank) plus specialized lenders like Canadian Tire Bank.
 
-An enterprise-grade financial tool that leverages the **IBM watsonx.ai** "Brain" to ingest multiple bank statements, extract transaction details, and automatically categorize spending.
+Unlike traditional parsers, this tool uses a Text-to-Data pattern, leveraging the Llama-3.1-8b model via IBM Watsonx to identify transactions directly from raw text.
 
-## 🚀 Features
-* **Multi-File Support**: Upload multiple PDFs, CSVs, or Excel files simultaneously.
-* **Intelligent Extraction**: Uses `pdfplumber` and Llama-3-3-70b to understand unstructured banking layouts.
-* **Auto-Categorization**: Automatically labels transactions into categories (e.g., Housing, Food, Salary).
-* **Export to Excel**: Download a consolidated, cleaned report for all uploaded statements.
+🚀 Key Features
+Universal Ingestion: Supports PDF, CSV, and Excel without requiring specific column headers.
 
-## 🛠️ Tech Stack
-* **Brain**: [IBM watsonx.ai](https://www.ibm.com/watsonx) (meta-llama/llama-3-3-70b-instruct)
-* **Frontend**: Streamlit
-* **Data Processing**: Pandas, pdfplumber
-* **Integration**: LangChain IBM
+Contextual AI Classification: Automatically maps transactions to industry-standard categories:
 
-## 🔐 Setup Instructions
+Utilities, Shopping, Health & Fitness, Interest Charge, Overdraft Fee, NSF, Transportation, Fees and Charges, Food and Dining, Groceries, Entertainment, Mortgage, Withdrawal, Deposits.
 
-### 1. Environment Secrets
-To run this Space, you must add the following **Secrets** in your Space Settings:
+AI Training & Fine-Tuning: A sidebar "Memory" feature allows you to embed specific business rules into the AI prompt (e.g., "Mapping transfers to 5826 as Mortgage payments").
 
-| Secret Name | Description |
-| :--- | :--- |
-| `WATSONX_APIKEY` | Your IBM Cloud IAM API Key |
-| `PROJECT_ID` | Your watsonx.ai Project ID |
-| `WATSONX_URL` | Your IBM Cloud region URL (Default: `https://us-south.ml.cloud.ibm.com`) |
+RBC Multi-Column Support: Intelligent enough to distinguish between "Cheques & Debits" and "Deposits & Credits" in complex RBC/Scotiabank PDF layouts.
 
-### 2. Local Development
-If you wish to run this locally:
-1. Clone the repo.
-2. Create a `.env` file with your credentials.
-3. Install requirements: `pip install -r requirements.txt`.
-4. Run: `streamlit run app.py`.
+Real-time Analytics: Visualizes spending habits and isolates high-priority items like bank fees (NSF/Overdraft).
 
-## 📝 Disclaimer
-This application is an AI-powered tool. Always verify the categorized output against your original bank statements for accuracy before making financial decisions.
+🛠️ Installation & Setup
+1. Prerequisites
+Ensure you have Python 3.9+ and an active IBM Cloud / Watsonx.ai account.
+
+2. Dependencies
+Create a requirements.txt file and install:
+
+Plaintext
+streamlit
+pdfplumber
+pandas
+openpyxl
+langchain-ibm
+ibm-watsonx-ai
+pip install -r requirements.txt
+
+3. Environment Secrets
+For local development, create a .streamlit/secrets.toml file. If deploying to Streamlit Cloud, add these to the "Secrets" dashboard:
+
+Ini, TOML
+WATSONX_APIKEY = "your_ibm_cloud_api_key"
+WATSONX_PROJECT_ID = "your_watsonx_project_guid"
+🧠 Working Logic
+Text Extraction: The app uses pdfplumber and pandas to convert any file format into a single stream of raw text.
+
+Prompt Engineering: The text is wrapped in a specialized Instruction Prompt that defines the table schema and the 15 standard banking categories.
+
+LLM Inference: The meta-llama/llama-3-1-8b base model analyzes the text. Because we use WatsonxLLM (Text-to-Text), it bypasses common chat-functionality errors.
+
+Data Structuring: The AI returns a pipe-delimited (|) string which is then converted back into a structured Pandas DataFrame for visualization.
+
+📂 Supported Banks (Tested)
+RBC: Business Account Statements (including Operating Loans).
+
+Canadian Tire: Triangle Mastercard PDFs.
+
+Scotiabank: Scene+ Visa and Chequing CSVs/PDFs.
+
+Universal: Any CSV containing Date, Description, and Amount.
