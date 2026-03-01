@@ -1,6 +1,7 @@
 streamlit
 pdfplumber
 pandas
-openpyxl
-langchain-ibm
 ibm-watsonx-ai
+openpyxl
+numpy
+python-dateutil
