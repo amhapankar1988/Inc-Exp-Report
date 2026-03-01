@@ -1,149 +1,282 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
-import io
 import re
-from langchain_ibm import WatsonxLLM
+from collections import defaultdict
+
+from ibm_watsonx_ai.foundation_models import ModelInference
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 
 # =========================================================
-# 1. AI CONFIGURATION (Fixed Indentation & API Logic)
+# PAGE CONFIG
 # =========================================================
+st.set_page_config(page_title="Universal Bank AI", layout="wide")
+
+# =========================================================
+# AI MODEL
+# =========================================================
+@st.cache_resource
 def get_ai_model():
     try:
         api_key = st.secrets["WATSONX_APIKEY"].strip()
         project_id = st.secrets["WATSONX_PROJECT_ID"].strip()
-        url = "https://ca-tor.ml.cloud.ibm.com"
 
-        # Define parameters correctly
         parameters = {
             GenParams.DECODING_METHOD: "greedy",
-            GenParams.MAX_NEW_TOKENS: 1000,
+            GenParams.MAX_NEW_TOKENS: 600,
             GenParams.TEMPERATURE: 0,
         }
 
-        # Use WatsonxLLM for base models to avoid 'function' errors
-        return WatsonxLLM(
-            model_id="meta-llama/llama-3-1-8b",
-            url=url,
+        model = ModelInference(
+            model_id="meta-llama/llama-3-1-8b-instruct",
+            credentials={
+                "apikey": api_key,
+                "url": "https://ca-tor.ml.cloud.ibm.com",
+            },
             project_id=project_id,
-            apikey=api_key,
             params=parameters
         )
+
+        return model
+
     except Exception as e:
-        st.error(f"Watsonx Config Error: {e}")
+        st.error(f"AI setup failed: {e}")
         return None
 
-# =========================================================
-# 2. DATA EXTRACTION & CLASSIFICATION
-# =========================================================
 
-def extract_raw_text(file):
-    text_content = ""
-    filename = file.name.lower()
-    try:
-        if filename.endswith('.pdf'):
-            with pdfplumber.open(file) as pdf:
-                for page in pdf.pages:
-                    text_content += (page.extract_text() or "") + "\n"
-        elif filename.endswith('.csv'):
-            text_content = pd.read_csv(file).to_string()
-        else:
-            text_content = pd.read_excel(file).to_string()
-    except Exception as e:
-        st.error(f"Error reading {filename}: {e}")
-    return text_content
+# =========================================================
+# CATEGORY ENGINE (FAST RULE ENGINE)
+# =========================================================
+category_rules = {
+    "starbucks": "Food and Dining",
+    "tim hortons": "Food and Dining",
+    "uber": "Transportation",
+    "lyft": "Transportation",
+    "metro": "Groceries",
+    "walmart": "Shopping",
+    "amazon": "Shopping",
+    "netflix": "Entertainment",
+    "spotify": "Entertainment",
+    "shell": "Transportation",
+    "esso": "Transportation",
+}
 
-def ai_classify_transactions(raw_text, model, user_context=""):
-    categories = [
-        "Utilities", "Shopping", "Health and Fitness", "Interest Charge", 
-        "Overdraft Fee", "NSF", "Transportation", "Fees and Charges", 
-        "Food and Dining", "Groceries", "Entertainment", "Mortgage", 
-        "Withdrawal", "Deposits", "Other"
-    ]
-    
-    # Prompt structured for Llama-3-1 Base
-    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are a Canadian banking expert. Extract transactions from the text into a table.
-Format: Date | Description | Amount | Category
+
+def rule_based_category(desc):
+    desc = desc.lower()
+
+    for key, val in category_rules.items():
+        if key in desc:
+            return val
+
+    if "interest" in desc:
+        return "Interest Charge"
+
+    if "fee" in desc:
+        return "Fees and Charges"
+
+    if "deposit" in desc:
+        return "Deposits"
+
+    return None
+
+
+# =========================================================
+# TEXT EXTRACTION
+# =========================================================
+def extract_text_from_pdf(file):
+    text = ""
+
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            content = page.extract_text()
+            if content:
+                text += content + "\n"
+
+    return text
+
+
+# =========================================================
+# REGEX TRANSACTION PARSER (VERY IMPORTANT)
+# =========================================================
+def regex_extract_transactions(text):
+    pattern = r'(\d{2}[-/]\d{2}[-/]\d{2,4})\s+(.*?)\s+(-?\$?\d+\.\d{2})'
+    matches = re.findall(pattern, text)
+
+    data = []
+
+    for date, desc, amount in matches:
+        cat = rule_based_category(desc) or "Other"
+        data.append([date, desc, amount, cat])
+
+    df = pd.DataFrame(
+        data,
+        columns=["Date", "Description", "Amount", "Category"]
+    )
+
+    return df
+
+
+# =========================================================
+# AI CLASSIFIER (USED ONLY WHEN NEEDED)
+# =========================================================
+def ai_classify_remaining(df, model, context):
+
+    uncategorized = df[df["Category"] == "Other"]
+
+    if uncategorized.empty:
+        return df
+
+    text_block = "\n".join(
+        uncategorized["Description"].astype(str).tolist()
+    )
+
+    prompt = f"""
+You categorize bank transactions in Canada.
+
+Categories:
+Food and Dining
+Groceries
+Transportation
+Shopping
+Entertainment
+Utilities
+Mortgage
+Fees and Charges
+Interest Charge
+Health and Fitness
+Other
+
 Rules:
-- Categories: {", ".join(categories)}
-- Spending is negative (e.g., -50.00). Deposits are positive.
-- {user_context}
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-Statement Text:
-{raw_text[:4000]}
-<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-Date | Description | Amount | Category
+{context}
+
+Transactions:
+{text_block}
+
+Return format:
+Description | Category
 """
-    
+
     try:
-        # Get raw response string
-        response = model.invoke(prompt) 
-        
-        # Parse text into DataFrame
-        lines = response.strip().split('\n')
-        data = []
-        for line in lines:
-            if '|' in line and "Date" not in line:
-                parts = [p.strip() for p in line.split('|')]
-                if len(parts) >= 4:
-                    data.append(parts[:4])
-        
-        return pd.DataFrame(data, columns=["Date", "Description", "Amount", "Category"])
+        response = model.generate(prompt)
+        result = response["results"][0]["generated_text"]
+
+        mapping = {}
+
+        for line in result.split("\n"):
+            if "|" in line:
+                parts = line.split("|")
+                if len(parts) >= 2:
+                    mapping[parts[0].strip()] = parts[1].strip()
+
+        df["Category"] = df.apply(
+            lambda row: mapping.get(row["Description"], row["Category"]),
+            axis=1
+        )
+
     except Exception as e:
-        st.error(f"AI Error: {e}")
-        return pd.DataFrame()
+        st.warning("AI categorization fallback used")
+
+    return df
+
 
 # =========================================================
-# 3. STREAMLIT UI
+# MAIN PROCESSOR
 # =========================================================
+def process_file(file, model, context):
+    name = file.name.lower()
 
-st.set_page_config(page_title="Universal Bank AI", layout="wide")
-st.title("🏦 Universal Bank AI Analyzer")
+    if name.endswith("pdf"):
+        raw_text = extract_text_from_pdf(file)
+        df = regex_extract_transactions(raw_text)
 
-if "context" not in st.session_state: 
+    elif name.endswith("csv"):
+        df = pd.read_csv(file)
+
+    else:
+        df = pd.read_excel(file)
+
+    # Clean amounts
+    df["Amount"] = (
+        df["Amount"]
+        .astype(str)
+        .str.replace(r"[^\d.-]", "", regex=True)
+    )
+
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+
+    df = ai_classify_remaining(df, model, context)
+
+    return df
+
+
+# =========================================================
+# UI
+# =========================================================
+st.title("🏦 Universal Bank AI Analyzer (Pro Version)")
+
+if "context" not in st.session_state:
     st.session_state.context = ""
 
 with st.sidebar:
-    st.header("🧠 AI Rules")
-    new_rule = st.text_area("Example: 'Starbucks is Food and Dining'")
-    if st.button("Update Rules"):
-        st.session_state.context += f" {new_rule}."
-        st.success("Rule Saved")
+    st.header("AI Learning Rules")
 
-files = st.file_uploader("Upload Bank Statements", type=["pdf", "csv", "xlsx"], accept_multiple_files=True)
+    rule = st.text_area("Example: Costco is Groceries")
+
+    if st.button("Save Rule"):
+        st.session_state.context += f"\n{rule}"
+        st.success("AI learned new rule")
+
+files = st.file_uploader(
+    "Upload statements",
+    type=["pdf", "csv", "xlsx"],
+    accept_multiple_files=True
+)
 
 if files:
-    ai_model = get_ai_model()
-    if ai_model:
-        all_results = []
-        for f in files:
-            with st.spinner(f"AI Analyzing {f.name}..."):
-                raw_text = extract_raw_text(f)
-                df = ai_classify_transactions(raw_text, ai_model, st.session_state.context)
-                if not df.empty: 
-                    all_results.append(df)
-        
-        if all_results:
-            final_df = pd.concat(all_results, ignore_index=True)
-            
-            # Clean numeric data
-            final_df["Amount"] = final_df["Amount"].astype(str).str.replace(r'[^\d.-]', '', regex=True)
-            final_df["Amount"] = pd.to_numeric(final_df["Amount"], errors='coerce').fillna(0.0)
-            
-            st.subheader("Classified Transactions")
-            st.dataframe(final_df, use_container_width=True)
-            
-            # Analytics
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("### Spending by Category")
-                spent = final_df[final_df["Amount"] < 0].groupby("Category")["Amount"].sum().abs()
-                st.bar_chart(spent)
-            with c2:
-                st.write("### Quick Stats")
-                total_spent = final_df[final_df["Amount"] < 0]["Amount"].sum()
-                st.metric("Total Expenses", f"${abs(total_spent):,.2f}")
-                fees = final_df[final_df["Category"].str.contains("Fee|NSF|Interest", case=False, na=False)]["Amount"].sum()
-                st.metric("Bank Fees", f"${abs(fees):,.2f}")
+    model = get_ai_model()
+
+    results = []
+
+    progress = st.progress(0)
+
+    for i, f in enumerate(files):
+        with st.spinner(f"Processing {f.name}"):
+            df = process_file(f, model, st.session_state.context)
+            results.append(df)
+
+        progress.progress((i + 1) / len(files))
+
+    final_df = pd.concat(results)
+
+    st.subheader("Transactions")
+    st.dataframe(final_df, use_container_width=True)
+
+    # =========================================================
+    # ANALYTICS
+    # =========================================================
+    col1, col2, col3 = st.columns(3)
+
+    total_spent = final_df[final_df["Amount"] < 0]["Amount"].sum()
+    total_income = final_df[final_df["Amount"] > 0]["Amount"].sum()
+
+    with col1:
+        st.metric("Total Spending", f"${abs(total_spent):,.2f}")
+
+    with col2:
+        st.metric("Total Income", f"${total_income:,.2f}")
+
+    with col3:
+        st.metric("Net", f"${(total_income + total_spent):,.2f}")
+
+    st.subheader("Spending by Category")
+
+    spending = (
+        final_df[final_df["Amount"] < 0]
+        .groupby("Category")["Amount"]
+        .sum()
+        .abs()
+        .sort_values(ascending=False)
+    )
+
+    st.bar_chart(spending)
