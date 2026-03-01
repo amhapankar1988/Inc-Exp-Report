@@ -20,7 +20,7 @@ def get_ai_model():
         api_key = st.secrets["WATSONX_APIKEY"].strip()
         project_id = st.secrets["WATSONX_PROJECT_ID"].strip()
         return ModelInference(
-            model_id="ibm/granite-3-8b-instruct",
+            model_id="meta-llama/llama-3-3-70b-instruct",
             credentials={"apikey": api_key, "url": "https://ca-tor.ml.cloud.ibm.com"},
             project_id=project_id,
             params={
