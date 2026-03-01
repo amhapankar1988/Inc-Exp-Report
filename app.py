@@ -28,7 +28,7 @@ def get_ai_model():
         }
 
         model = ModelInference(
-            model_id="meta-llama/llama-3-1-8b-instruct",
+            model_id="ibm/granite-3-8b-instruct",
             credentials={
                 "apikey": api_key,
                 "url": "https://ca-tor.ml.cloud.ibm.com",
