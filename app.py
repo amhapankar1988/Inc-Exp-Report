@@ -4,30 +4,50 @@ import pdfplumber
 import re
 import os
 import joblib
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from ibm_watsonx_ai.foundation_models import ModelInference
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 
 # =========================================================
-# PAGE CONFIG & AI SETUP
+# CONFIG
 # =========================================================
 st.set_page_config(page_title="Universal Bank AI", layout="wide")
 
+MODEL_PATH = "category_training.pkl"
+
+# =========================================================
+# LOAD TRAINED RULES
+# =========================================================
+def load_training():
+    if os.path.exists(MODEL_PATH):
+        return joblib.load(MODEL_PATH)
+    return {}
+
+def save_training(data):
+    joblib.dump(data, MODEL_PATH)
+
+trained_rules = load_training()
+
+# =========================================================
+# AI MODEL
+# =========================================================
 @st.cache_resource
 def get_ai_model():
     try:
         api_key = st.secrets["WATSONX_APIKEY"].strip()
         project_id = st.secrets["WATSONX_PROJECT_ID"].strip()
+
         return ModelInference(
             model_id="meta-llama/llama-3-3-70b-instruct",
-            credentials={"apikey": api_key, "url": "https://ca-tor.ml.cloud.ibm.com"},
+            credentials={
+                "apikey": api_key,
+                "url": "https://ca-tor.ml.cloud.ibm.com",
+            },
             project_id=project_id,
             params={
                 GenParams.DECODING_METHOD: "greedy",
-                GenParams.MAX_NEW_TOKENS: 600,
+                GenParams.MAX_NEW_TOKENS: 400,
                 GenParams.TEMPERATURE: 0.1,
-            }
+            },
         )
     except Exception as e:
         st.error(f"AI setup failed: {e}")
@@ -36,159 +56,264 @@ def get_ai_model():
 ai_model = get_ai_model()
 
 # =========================================================
-# BANK DETECTION LOGIC
+# BANK DETECTION
 # =========================================================
 def detect_bank(text):
     text = text.lower()
-    if "triangle" in text or "canadian tire" in text:
+
+    if "triangle mastercard" in text:
         return "TRIANGLE"
-    if "royal bank" in text or "rbc" in text:
-        if "operating loan" in text or "business loan" in text:
-            return "RBC_LOAN"
+
+    if "business account statement" in text:
         return "RBC_BUSINESS"
+
+    if "operating loan statement" in text:
+        return "RBC_LOAN"
+
     return "GENERIC"
 
 # =========================================================
-# SPECIALIZED PARSERS
+# TRIANGLE PARSER (FIXED)
 # =========================================================
+def parse_triangle(file):
+    rows = []
 
+    with pdfplumber.open(file) as pdf:
+        text = "\n".join(page.extract_text() for page in pdf.pages)
+
+    pattern = re.compile(
+        r"(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)\s+\d{1,2}.*?([A-Za-z0-9#\-\s]+?)\s(-?\d+\.\d{2})"
+    )
+
+    matches = pattern.findall(text)
+
+    for m in matches:
+        desc = m[1].strip()
+        amt = float(m[2])
+
+        # Critical logic
+        if amt < 0:
+            amt = abs(amt)  # payments = income
+        else:
+            amt = -amt  # purchases = spending
+
+        rows.append(["", desc, amt])
+
+    return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
+
+# =========================================================
+# RBC BUSINESS PARSER (FIXED)
+# =========================================================
 def parse_rbc_business(file):
-    """Specific geometric parser for RBC Business tables."""
-    data = []
+    rows = []
+
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            table = page.extract_table(table_settings={
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "text",
-                "snap_y_tolerance": 5,
-            })
-            if not table: continue
-            
-            for row in table:
-                # Clean row: remove None and empty strings
-                row = [str(item).strip() if item else "" for item in row]
-                # Look for rows that start with a date (e.g., '11 Dec' or '02 Jan')
-                if len(row) >= 4 and re.match(r"^\d{1,2}\s[a-zA-Z]{3}", row[0]):
-                    date, desc = row[0], row[1]
-                    debit = row[2].replace(",", "")
-                    credit = row[3].replace(",", "")
-                    
-                    try:
-                        if debit:
-                            amt = -float(debit)
-                        elif credit:
-                            amt = float(credit)
-                        else:
-                            continue
-                        data.append([date, desc, amt])
-                    except ValueError:
-                        continue
-    return pd.DataFrame(data, columns=["Date", "Description", "Amount"])
+            text = page.extract_text().split("\n")
 
-def parse_triangle_ai(file, model):
-    """AI parser with strict sign-logic for Triangle Mastercard."""
-    text = ""
+            for line in text:
+                match = re.search(
+                    r"(\d{1,2}\s\w{3})\s+(.*?)\s+(-?\d+\.\d{2})?\s+(-?\d+\.\d{2})",
+                    line,
+                )
+
+                if match:
+                    date = match.group(1)
+                    desc = match.group(2)
+
+                    debit = match.group(3)
+                    credit = match.group(4)
+
+                    if debit:
+                        amount = -float(debit)
+                    else:
+                        amount = float(credit)
+
+                    rows.append([date, desc, amount])
+
+    return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
+
+# =========================================================
+# RBC LOAN PARSER
+# =========================================================
+def parse_rbc_loan(file):
+    rows = []
+
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            text += page.extract_text() + "\n"
+            text = page.extract_text().split("\n")
 
+            for line in text:
+                match = re.search(
+                    r"(Dec|Jan)\s+\d{1,2}.*?([A-Za-z\s\-]+)\s(-?\$?\d+\.\d{2})",
+                    line,
+                )
+
+                if match:
+                    desc = match.group(2).strip()
+                    amt = float(match.group(3).replace("$", ""))
+
+                    rows.append(["", desc, amt])
+
+    return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
+
+# =========================================================
+# AI FALLBACK
+# =========================================================
+def ai_parse(text, model):
     prompt = f"""
-    Extract transactions from this Canadian Tire Triangle Mastercard statement.
-    
-    SIGN LOGIC IS CRITICAL:
-    1. Look for the 'Transactions' section.
-    2. PAYMENTS/CREDITS are usually shown with a MINUS sign (e.g. -500.00). These are INCOME. Extract as POSITIVE (+).
-    3. PURCHASES/INTEREST are shown as POSITIVE. These are SPENDING. Extract as NEGATIVE (-).
-    
-    Return ONLY a markdown table: Date | Description | Amount
-    Text:
-    {text[:6000]}
-    """
-    return call_ai_for_table(prompt, model)
+Extract transactions into table:
+Date | Description | Amount
+Income positive, expenses negative.
 
-def call_ai_for_table(prompt, model):
+{text[:5000]}
+"""
+
     try:
-        response = model.generate(prompt)
-        raw = response["results"][0]["generated_text"]
+        result = model.generate(prompt)
+        raw = result["results"][0]["generated_text"]
+
         rows = []
         for line in raw.split("\n"):
-            if "|" in line and "Date" not in line and "---" not in line:
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) >= 3:
+            if "|" in line:
+                p = [x.strip() for x in line.split("|")]
+                if len(p) >= 3:
                     try:
-                        amt = float(re.sub(r"[^\d.-]", "", parts[2]))
-                        rows.append([parts[0], parts[1], amt])
-                    except: continue
+                        amt = float(re.sub(r"[^\d.-]", "", p[2]))
+                        rows.append([p[0], p[1], amt])
+                    except:
+                        pass
+
         return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
+
     except:
         return pd.DataFrame()
 
 # =========================================================
-# MAIN PROCESSING ENGINE
+# CATEGORIZATION
 # =========================================================
-def process_file(file, model):
-    with pdfplumber.open(file) as pdf:
-        header = pdf.pages[0].extract_text()
-    
-    bank = detect_bank(header)
-    st.sidebar.info(f"Processing: {bank} ({file.name})")
-
-    if bank == "RBC_BUSINESS":
-        df = parse_rbc_business(file)
-    elif bank == "TRIANGLE":
-        df = parse_triangle_ai(file, model)
-    else:
-        # Fallback for Generic/RBC Loan
-        prompt = f"Extract transactions from this {bank} statement. Spending negative, Income positive. \nText: {header[:4000]}"
-        df = call_ai_for_table(prompt, model)
-
-    if not df.empty:
-        df["Category"] = df["Description"].apply(categorize)
-    return df
-
-# =========================================================
-# CATEGORIZATION & UTILS (Rules + Learning)
-# =========================================================
-rules = {
-    "uber": "Transportation", "amazon": "Shopping", "walmart": "Shopping",
-    "costco": "Groceries", "metro": "Groceries", "starbucks": "Food",
-    "interest": "Interest Charge", "fee": "Fees", "payment": "Bill Payment"
+base_rules = {
+    "tim hortons": "Food",
+    "esso": "Fuel",
+    "freshco": "Groceries",
+    "uber": "Transportation",
+    "amazon": "Shopping",
+    "cdn tire": "Shopping",
+    "loan payment": "Loan Payment",
+    "interest": "Interest",
+    "fee": "Bank Fee",
+    "transfer": "Transfer",
 }
 
 def categorize(desc):
-    desc_lower = desc.lower()
-    for key, cat in rules.items():
-        if key in desc_lower: return cat
+    d = desc.lower()
+
+    # trained rules first
+    for key, val in trained_rules.items():
+        if key in d:
+            return val
+
+    for key, val in base_rules.items():
+        if key in d:
+            return val
+
     return "Other"
 
 # =========================================================
-# STREAMLIT UI
+# MAIN PROCESS
+# =========================================================
+def process_file(file):
+    with pdfplumber.open(file) as pdf:
+        header = pdf.pages[0].extract_text()
+
+    bank = detect_bank(header)
+    st.sidebar.info(f"Detected: {bank}")
+
+    if bank == "TRIANGLE":
+        df = parse_triangle(file)
+
+    elif bank == "RBC_BUSINESS":
+        df = parse_rbc_business(file)
+
+    elif bank == "RBC_LOAN":
+        df = parse_rbc_loan(file)
+
+    else:
+        df = ai_parse(header, ai_model)
+
+    if not df.empty:
+        df["Category"] = df["Description"].apply(categorize)
+
+    return df
+
+# =========================================================
+# SIDEBAR TRAINING
+# =========================================================
+st.sidebar.header("Train Categorization")
+
+new_keyword = st.sidebar.text_input("Keyword")
+new_category = st.sidebar.text_input("Category")
+
+if st.sidebar.button("Add Rule"):
+    trained_rules[new_keyword.lower()] = new_category
+    save_training(trained_rules)
+    st.sidebar.success("Rule saved!")
+
+# =========================================================
+# UI
 # =========================================================
 st.title("🏦 Universal Bank AI Analyzer")
 
-uploaded_files = st.file_uploader("Upload Statements", type=["pdf"], accept_multiple_files=True)
+files = st.file_uploader(
+    "Upload Statements",
+    type=["pdf"],
+    accept_multiple_files=True
+)
 
-if uploaded_files:
-    all_dfs = []
-    for f in uploaded_files:
-        res = process_file(f, ai_model)
-        if not res.empty:
-            all_dfs.append(res)
-    
-    if all_dfs:
-        final_df = pd.concat(all_dfs, ignore_index=True)
-        st.subheader("Extracted Transactions")
+if files:
+    dfs = []
+
+    for f in files:
+        df = process_file(f)
+        if not df.empty:
+            dfs.append(df)
+
+    if dfs:
+        final_df = pd.concat(dfs, ignore_index=True)
+
+        st.subheader("Transactions")
         st.dataframe(final_df, use_container_width=True)
-        
-        # Financial Metrics
-        spending = final_df[final_df["Amount"] < 0]["Amount"].sum()
-        income = final_df[final_df["Amount"] > 0]["Amount"].sum()
-        
+
+        spending = final_df[final_df.Amount < 0].Amount.sum()
+        income = final_df[final_df.Amount > 0].Amount.sum()
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("Total Spending", f"${abs(spending):,.2f}", delta_color="inverse")
-        c2.metric("Total Income / Payments", f"${income:,.2f}")
-        c3.metric("Net Flow", f"${income + spending:,.2f}")
-        
-        st.bar_chart(final_df[final_df["Amount"] < 0].groupby("Category")["Amount"].sum().abs())
+
+        c1.metric("Total Spending", f"${abs(spending):,.2f}")
+        c2.metric("Income / Payments", f"${income:,.2f}")
+        c3.metric("Net", f"${income + spending:,.2f}")
+
+        st.bar_chart(
+            final_df[final_df.Amount < 0]
+            .groupby("Category")["Amount"]
+            .sum()
+            .abs()
+        )
+
+        # TRAIN FROM "OTHER"
+        st.sidebar.subheader("Auto-train from Other")
+
+        others = final_df[final_df.Category == "Other"]["Description"].unique()
+
+        if len(others) > 0:
+            selected = st.sidebar.selectbox("Uncategorized", others)
+
+            new_cat = st.sidebar.text_input("Map to category")
+
+            if st.sidebar.button("Train AI Mapping"):
+                trained_rules[selected.lower()] = new_cat
+                save_training(trained_rules)
+                st.sidebar.success("AI learned new mapping!")
+
     else:
-        st.error("No transactions could be parsed. Check PDF format.")
+        st.error("No transactions extracted.")
