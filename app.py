@@ -4,56 +4,50 @@ import pdfplumber
 import re
 import os
 import joblib
+
 from ibm_watsonx_ai.foundation_models import ModelInference
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 
-# =========================================================
-# CONFIG
-# =========================================================
 st.set_page_config(page_title="Universal Bank AI", layout="wide")
 
-MODEL_PATH = "category_training.pkl"
+MODEL_FILE = "trained_categories.pkl"
 
 # =========================================================
 # LOAD TRAINED RULES
 # =========================================================
-def load_training():
-    if os.path.exists(MODEL_PATH):
-        return joblib.load(MODEL_PATH)
+def load_rules():
+    if os.path.exists(MODEL_FILE):
+        return joblib.load(MODEL_FILE)
     return {}
 
-def save_training(data):
-    joblib.dump(data, MODEL_PATH)
+def save_rules(rules):
+    joblib.dump(rules, MODEL_FILE)
 
-trained_rules = load_training()
+trained_rules = load_rules()
 
 # =========================================================
 # AI MODEL
 # =========================================================
 @st.cache_resource
-def get_ai_model():
+def load_ai():
     try:
         api_key = st.secrets["WATSONX_APIKEY"].strip()
         project_id = st.secrets["WATSONX_PROJECT_ID"].strip()
 
         return ModelInference(
             model_id="meta-llama/llama-3-3-70b-instruct",
-            credentials={
-                "apikey": api_key,
-                "url": "https://ca-tor.ml.cloud.ibm.com",
-            },
+            credentials={"apikey": api_key, "url": "https://ca-tor.ml.cloud.ibm.com"},
             project_id=project_id,
             params={
                 GenParams.DECODING_METHOD: "greedy",
-                GenParams.MAX_NEW_TOKENS: 400,
+                GenParams.MAX_NEW_TOKENS: 500,
                 GenParams.TEMPERATURE: 0.1,
             },
         )
-    except Exception as e:
-        st.error(f"AI setup failed: {e}")
+    except:
         return None
 
-ai_model = get_ai_model()
+ai_model = load_ai()
 
 # =========================================================
 # BANK DETECTION
@@ -64,114 +58,119 @@ def detect_bank(text):
     if "triangle mastercard" in text:
         return "TRIANGLE"
 
-    if "business account statement" in text:
-        return "RBC_BUSINESS"
+    if "royal bank of canada" in text:
+        if "operating loan" in text:
+            return "RBC_LOAN"
+        return "RBC"
 
-    if "operating loan statement" in text:
-        return "RBC_LOAN"
+    if "td canada trust" in text:
+        return "TD"
+
+    if "bank of montreal" in text or "bmo" in text:
+        return "BMO"
+
+    if "scotiabank" in text:
+        return "SCOTIA"
+
+    if "cibc" in text:
+        return "CIBC"
+
+    if "national bank of canada" in text:
+        return "NBC"
 
     return "GENERIC"
 
 # =========================================================
-# TRIANGLE PARSER (FIXED)
+# UNIVERSAL PDF TEXT EXTRACTOR
 # =========================================================
-def parse_triangle(file):
+def extract_text_from_pdf(file):
+    text = ""
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text += t + "\n"
+    return text
+
+# =========================================================
+# UNIVERSAL TRANSACTION REGEX
+# =========================================================
+def extract_transactions(text):
     rows = []
 
-    with pdfplumber.open(file) as pdf:
-        text = "\n".join(page.extract_text() for page in pdf.pages)
-
-    pattern = re.compile(
-        r"(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)\s+\d{1,2}.*?([A-Za-z0-9#\-\s]+?)\s(-?\d+\.\d{2})"
+    pattern = re.findall(
+        r"(\d{1,2}\s[A-Za-z]{3})\s+(.*?)\s+(-?\$?\d{1,3}(?:,\d{3})*\.\d{2})",
+        text,
     )
 
-    matches = pattern.findall(text)
+    for date, desc, amt in pattern:
+        amt = float(amt.replace("$", "").replace(",", ""))
+        rows.append([date, desc.strip(), amt])
+
+    return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
+
+# =========================================================
+# TRIANGLE FIXED PARSER
+# =========================================================
+def parse_triangle(text):
+    rows = []
+
+    matches = re.findall(
+        r"(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)\s+\d{1,2}.*?([A-Za-z0-9#\-\s]+?)\s(-?\d+\.\d{2})",
+        text,
+    )
 
     for m in matches:
         desc = m[1].strip()
         amt = float(m[2])
 
-        # Critical logic
         if amt < 0:
-            amt = abs(amt)  # payments = income
+            amt = abs(amt)
         else:
-            amt = -amt  # purchases = spending
+            amt = -amt
 
         rows.append(["", desc, amt])
 
     return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
 
 # =========================================================
-# RBC BUSINESS PARSER (FIXED)
-# =========================================================
-def parse_rbc_business(file):
-    rows = []
-
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text().split("\n")
-
-            for line in text:
-                match = re.search(
-                    r"(\d{1,2}\s\w{3})\s+(.*?)\s+(-?\d+\.\d{2})?\s+(-?\d+\.\d{2})",
-                    line,
-                )
-
-                if match:
-                    date = match.group(1)
-                    desc = match.group(2)
-
-                    debit = match.group(3)
-                    credit = match.group(4)
-
-                    if debit:
-                        amount = -float(debit)
-                    else:
-                        amount = float(credit)
-
-                    rows.append([date, desc, amount])
-
-    return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
-
-# =========================================================
 # RBC LOAN PARSER
 # =========================================================
-def parse_rbc_loan(file):
+def parse_rbc_loan(text):
     rows = []
 
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text().split("\n")
+    matches = re.findall(
+        r"(Dec|Jan)\s+\d{1,2}.*?([A-Za-z\s\-]+)\s(-?\$?\d+\.\d{2})",
+        text,
+    )
 
-            for line in text:
-                match = re.search(
-                    r"(Dec|Jan)\s+\d{1,2}.*?([A-Za-z\s\-]+)\s(-?\$?\d+\.\d{2})",
-                    line,
-                )
-
-                if match:
-                    desc = match.group(2).strip()
-                    amt = float(match.group(3).replace("$", ""))
-
-                    rows.append(["", desc, amt])
+    for m in matches:
+        desc = m[1].strip()
+        amt = float(m[2].replace("$", ""))
+        rows.append(["", desc, amt])
 
     return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
 
 # =========================================================
-# AI FALLBACK
+# AI PARSER
 # =========================================================
-def ai_parse(text, model):
-    prompt = f"""
-Extract transactions into table:
-Date | Description | Amount
-Income positive, expenses negative.
+def ai_parse(text):
+    if ai_model is None:
+        return pd.DataFrame()
 
-{text[:5000]}
+    prompt = f"""
+Extract all bank transactions as a table:
+
+Date | Description | Amount
+Income positive
+Spending negative
+
+{text[:6000]}
 """
 
     try:
-        result = model.generate(prompt)
-        raw = result["results"][0]["generated_text"]
+        response = ai_model.generate(prompt)
+        raw = response["results"][0]["generated_text"]
 
         rows = []
         for line in raw.split("\n"):
@@ -194,8 +193,8 @@ Income positive, expenses negative.
 # =========================================================
 base_rules = {
     "tim hortons": "Food",
-    "esso": "Fuel",
     "freshco": "Groceries",
+    "esso": "Fuel",
     "uber": "Transportation",
     "amazon": "Shopping",
     "cdn tire": "Shopping",
@@ -208,38 +207,63 @@ base_rules = {
 def categorize(desc):
     d = desc.lower()
 
-    # trained rules first
-    for key, val in trained_rules.items():
-        if key in d:
-            return val
+    for k, v in trained_rules.items():
+        if k in d:
+            return v
 
-    for key, val in base_rules.items():
-        if key in d:
-            return val
+    for k, v in base_rules.items():
+        if k in d:
+            return v
 
     return "Other"
 
 # =========================================================
-# MAIN PROCESS
+# CSV / EXCEL PARSER
+# =========================================================
+def parse_table_file(file):
+    df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
+
+    df.columns = [c.lower() for c in df.columns]
+
+    possible_desc = ["description", "details", "merchant"]
+    possible_amt = ["amount", "amt", "value"]
+
+    desc_col = next((c for c in df.columns if c in possible_desc), None)
+    amt_col = next((c for c in df.columns if c in possible_amt), None)
+
+    if desc_col and amt_col:
+        df = df[[desc_col, amt_col]]
+        df.columns = ["Description", "Amount"]
+        df["Date"] = ""
+        return df[["Date", "Description", "Amount"]]
+
+    return pd.DataFrame()
+
+# =========================================================
+# PROCESS FILE
 # =========================================================
 def process_file(file):
-    with pdfplumber.open(file) as pdf:
-        header = pdf.pages[0].extract_text()
 
-    bank = detect_bank(header)
-    st.sidebar.info(f"Detected: {bank}")
+    if file.name.endswith(("csv", "xlsx", "xls")):
+        df = parse_table_file(file)
+        return df
+
+    text = extract_text_from_pdf(file)
+
+    bank = detect_bank(text)
+    st.sidebar.write(f"Detected Bank: {bank}")
 
     if bank == "TRIANGLE":
-        df = parse_triangle(file)
-
-    elif bank == "RBC_BUSINESS":
-        df = parse_rbc_business(file)
+        df = parse_triangle(text)
 
     elif bank == "RBC_LOAN":
-        df = parse_rbc_loan(file)
+        df = parse_rbc_loan(text)
 
     else:
-        df = ai_parse(header, ai_model)
+        df = extract_transactions(text)
+
+        if df.empty:
+            df = ai_parse(text)
 
     if not df.empty:
         df["Category"] = df["Description"].apply(categorize)
@@ -249,25 +273,25 @@ def process_file(file):
 # =========================================================
 # SIDEBAR TRAINING
 # =========================================================
-st.sidebar.header("Train Categorization")
+st.sidebar.header("Train AI Categorization")
 
-new_keyword = st.sidebar.text_input("Keyword")
-new_category = st.sidebar.text_input("Category")
+keyword = st.sidebar.text_input("Keyword")
+category = st.sidebar.text_input("Category")
 
 if st.sidebar.button("Add Rule"):
-    trained_rules[new_keyword.lower()] = new_category
-    save_training(trained_rules)
-    st.sidebar.success("Rule saved!")
+    trained_rules[keyword.lower()] = category
+    save_rules(trained_rules)
+    st.sidebar.success("Saved")
 
 # =========================================================
 # UI
 # =========================================================
-st.title("🏦 Universal Bank AI Analyzer")
+st.title("🏦 Universal Canadian Bank Analyzer")
 
 files = st.file_uploader(
-    "Upload Statements",
-    type=["pdf"],
-    accept_multiple_files=True
+    "Upload Statements (PDF / CSV / Excel)",
+    type=["pdf", "csv", "xlsx"],
+    accept_multiple_files=True,
 )
 
 if files:
@@ -281,16 +305,14 @@ if files:
     if dfs:
         final_df = pd.concat(dfs, ignore_index=True)
 
-        st.subheader("Transactions")
         st.dataframe(final_df, use_container_width=True)
 
         spending = final_df[final_df.Amount < 0].Amount.sum()
         income = final_df[final_df.Amount > 0].Amount.sum()
 
         c1, c2, c3 = st.columns(3)
-
-        c1.metric("Total Spending", f"${abs(spending):,.2f}")
-        c2.metric("Income / Payments", f"${income:,.2f}")
+        c1.metric("Spending", f"${abs(spending):,.2f}")
+        c2.metric("Income", f"${income:,.2f}")
         c3.metric("Net", f"${income + spending:,.2f}")
 
         st.bar_chart(
@@ -300,20 +322,18 @@ if files:
             .abs()
         )
 
-        # TRAIN FROM "OTHER"
-        st.sidebar.subheader("Auto-train from Other")
-
+        # Train directly from uncategorized
         others = final_df[final_df.Category == "Other"]["Description"].unique()
 
         if len(others) > 0:
-            selected = st.sidebar.selectbox("Uncategorized", others)
+            st.sidebar.subheader("Train from Uncategorized")
+            sel = st.sidebar.selectbox("Select", others)
+            new_cat = st.sidebar.text_input("Assign Category")
 
-            new_cat = st.sidebar.text_input("Map to category")
-
-            if st.sidebar.button("Train AI Mapping"):
-                trained_rules[selected.lower()] = new_cat
-                save_training(trained_rules)
-                st.sidebar.success("AI learned new mapping!")
+            if st.sidebar.button("Train"):
+                trained_rules[sel.lower()] = new_cat
+                save_rules(trained_rules)
+                st.sidebar.success("Learned!")
 
     else:
-        st.error("No transactions extracted.")
+        st.error("No transactions extracted")
